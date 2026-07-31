@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WorldRenderer</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --ctl-h: 30px;
+
+    --bg: #0d0d0d;
+    --panel: #0d0d0d;
+    --panel2: #1c1c1c;
+    --line: #2f2f2f;
+    --line-strong: #5c5c5c;
+    --text: #e8e8e8;
+    --muted: #9a9a9a;
+    --invert-bg: #d8d8d8;
+    --invert-text: #0d0d0d;
+
+    --green: #3fc98a;
+    --red: #ff7a6b;
+    --blue: #6ea8ff;
+    --yellow: #e0a83c;
+    --accent: #6ea8ff;
+
+    --overlay: rgba(13, 13, 13, 0.82);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; border-radius: 0; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", system-ui, sans-serif;
+    font-size: 13px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #globe { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  #globe:active { cursor: grabbing; }
+
+  .panel {
+    position: fixed;
+    background: var(--overlay);
+    border: 1px solid var(--line);
+    backdrop-filter: blur(6px);
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--line-strong);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.9px;
+    color: var(--muted);
+  }
+  .panel-head .spacer { margin-left: auto; }
+
+  .panel-body { padding: 8px 10px; }
+
+  #hud {
+    top: 10px;
+    left: 10px;
+    padding: 8px 10px;
+    white-space: pre;
+    pointer-events: none;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+
+  #controls { top: 10px; right: 10px; display: grid; }
+  #controls .panel-body { display: grid; gap: 8px; }
+  #controls label {
+    display: grid;
+    gap: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.9px;
+    color: var(--muted);
+  }
+
+  select, button {
+    height: var(--ctl-h);
+    padding: 0 8px;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    font: inherit;
+    font-size: 13px;
+    line-height: 1;
+  }
+  select:hover, button:hover { background: var(--panel2); border-color: var(--line-strong); }
+  button { cursor: pointer; color: var(--muted); }
+  button:hover { color: var(--text); }
+  button.active {
+    color: var(--invert-text);
+    background: var(--invert-bg);
+    border-color: var(--invert-bg);
+  }
+
+  #help {
+    bottom: 10px;
+    left: 10px;
+    padding: 7px 10px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  #credit {
+    position: fixed;
+    bottom: 8px;
+    right: 10px;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  #credit a { color: var(--muted); }
+  #credit a:hover { color: var(--text); }
+
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-items: center;
+    padding: 24px;
+    text-align: center;
+    color: var(--red);
+    font-size: 14px;
+  }
+
+  #debug {
+    top: 10px;
+    left: 10px;
+    display: none;
+    width: 340px;
+    max-height: calc(100vh - 20px);
+    overflow-y: auto;
+    font-variant-numeric: tabular-nums;
+  }
+  #debug.open { display: block; }
+  body.debug #hud { display: none; }
+
+  #debug .panel-body { padding: 0; }
+
+  .sec {
+    padding: 6px 10px 9px;
+    border-bottom: 1px solid var(--line);
+  }
+  .sec:last-child { border-bottom: 0; }
+  .sec > h3 {
+    margin: 2px 0 6px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.9px;
+    color: var(--muted);
+  }
+
+  .kv { display: grid; grid-template-columns: 1fr auto; gap: 0 12px; font-size: 12px; }
+  .kv > span:nth-child(odd) { color: var(--muted); }
+  .kv > span:nth-child(even) { font-family: ui-monospace, Consolas, monospace; }
+  .kv .warn { color: var(--yellow); }
+  .kv .bad { color: var(--red); }
+  .kv .ok { color: var(--green); }
+
+  .meter {
+    height: 6px;
+    margin: 5px 0 7px;
+    border: 1px solid var(--line);
+    background: var(--bg);
+  }
+  .meter > i { display: block; height: 100%; background: var(--blue); }
+  .meter.warn > i { background: var(--yellow); }
+  .meter.bad > i { background: var(--red); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  th, td { padding: 3px 6px; text-align: right; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th {
+    color: var(--muted);
+    border-bottom: 1px solid var(--line-strong);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    white-space: nowrap;
+  }
+  td { font-family: ui-monospace, Consolas, monospace; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--panel2); }
+  td.dim { color: var(--muted); }
+  td.hot { color: var(--yellow); }
+</style>
+</head>
+<body>
+<canvas id="globe"></canvas>
+<div id="hud" class="panel">starting</div>
+
+<div id="debug" class="panel">
+  <div class="panel-head">Debug <span class="spacer"></span><span id="debug-hint">~ to close</span></div>
+  <div class="panel-body" id="debug-body"></div>
+</div>
+
+<div id="controls" class="panel">
+  <div class="panel-body">
+    <label>imagery
+      <select id="imagery"></select>
+    </label>
+    <label>go to
+      <select id="place"></select>
+    </label>
+    <button id="reset">reset view</button>
+    <button id="debug-toggle">debug</button>
+    <button id="uncap-toggle">uncap fps</button>
+  </div>
+</div>
+
+<div id="help" class="panel">drag: pan &middot; wheel: zoom to cursor &middot; right/shift-drag: tilt &amp; rotate &middot; WASD: fly &middot; QE: rotate &middot; RF: tilt &middot; ~: debug</div>
+<div id="credit">
+  Terrain: <a href="https://registry.opendata.aws/terrain-tiles/">AWS Terrain Tiles</a> &middot;
+  Imagery: <a href="https://www.arcgis.com/home/item.html?id=10df2279f9684e4a9f6a7f08febac2a9">Esri World Imagery</a> /
+  <a href="https://s2maps.eu">EOX Sentinel-2 cloudless</a> (CC BY 4.0) /
+  <a href="https://www.earthdata.nasa.gov/engage/open-data-services-software/earthdata-developer-portal/gibs-api">NASA GIBS</a>
+</div>
+<div id="error"></div>
+<script type="module">
+import init, * as wr from './pkg/worldrenderer.js';
+import { IMAGERY_SOURCES, PLACES } from './sources.js';
+
+const hud = document.getElementById('hud');
+const errorBox = document.getElementById('error');
+
+function fail(message) {
+  errorBox.style.display = 'grid';
+  errorBox.textContent = message;
+}
+
+if (!navigator.gpu) {
+  fail('WebGPU is not available. Use Chrome/Edge 113+, or Firefox with WebGPU enabled.');
+} else {
+  await init();
+  try {
+    await wr.start('globe');
+  } catch (e) {
+    fail('Failed to start: ' + e);
+    throw e;
+  }
+
+  wr.jump_to(0, 20, 22000000);
+  wr.set_orientation(0, 0);
+
+  const imagerySelect = document.getElementById('imagery');
+  for (const [i, s] of IMAGERY_SOURCES.entries()) {
+    imagerySelect.add(new Option(s.name, String(i)));
+  }
+  imagerySelect.onchange = () => {
+    const s = IMAGERY_SOURCES[Number(imagerySelect.value)];
+    wr.set_imagery(s.url, s.maxZoom);
+  };
+
+  const placeSelect = document.getElementById('place');
+  for (const [i, p] of PLACES.entries()) {
+    placeSelect.add(new Option(p.name, String(i)));
+  }
+  placeSelect.onchange = () => {
+    const p = PLACES[Number(placeSelect.value)];
+    wr.fly_to(p.lon, p.lat, p.distance);
+  };
+
+  document.getElementById('reset').onclick = () => {
+    wr.fly_to(0, 15, 20000000);
+    wr.set_orientation(0, 0);
+  };
+
+  const plane = wr.add_model('./assets/plane.glb');
+  const routes = [
+    { pts: [-0.45, 51.47, 10500, 2.55, 49.01, 10500, 13.29, 52.55, 10500, -0.45, 51.47, 10500],
+      colour: 0xffe08aff, speed: 240, scale: 900 },
+    { pts: [-74.0, 40.6, 11000, -9.1, 38.8, 11000, 8.5, 47.5, 11000, -74.0, 40.6, 11000],
+      colour: 0x8ad6ffff, speed: 260, scale: 1200 },
+    { pts: [139.8, 35.5, 10500, 116.6, 40.1, 10500, 55.4, 25.3, 10500, 139.8, 35.5, 10500],
+      colour: 0xff9a8aff, speed: 250, scale: 1200 },
+    { pts: [151.2, -33.9, 10000, 174.8, -37.0, 10000, -122.4, 37.6, 10000, 151.2, -33.9, 10000],
+      colour: 0x9affb0ff, speed: 280, scale: 1400 },
+  ];
+  const waitForModel = setInterval(() => {
+    if (!wr.model_ready(plane)) return;
+    clearInterval(waitForModel);
+    for (const r of routes) {
+      wr.add_flight(plane, new Float64Array(r.pts), r.speed, r.scale, r.colour);
+    }
+  }, 100);
+
+  wr.add_icons(new Float64Array([6.8652, 45.8326, 5200]), 26, 0xffd75aff);
+  wr.add_line(new Float64Array([
+    6.60, 45.75, 3000,
+    6.75, 45.80, 3600,
+    6.8652, 45.8326, 4900,
+    7.00, 45.87, 3600,
+  ]), 3, 0x4ad6ffff);
+  wr.add_polygon(new Float64Array([
+    6.80, 45.78,
+    6.94, 45.78,
+    6.94, 45.87,
+    6.80, 45.87,
+  ]), 1200, 2600, 0xff5a7a88);
+
+  const debugPanel = document.getElementById('debug');
+  const debugBody = document.getElementById('debug-body');
+  const debugToggle = document.getElementById('debug-toggle');
+
+  function setDebug(on) {
+    debugPanel.classList.toggle('open', on);
+    debugToggle.classList.toggle('active', on);
+    document.body.classList.toggle('debug', on);
+  }
+  debugToggle.onclick = () => setDebug(!debugPanel.classList.contains('open'));
+
+  const uncapToggle = document.getElementById('uncap-toggle');
+  let uncapped = false;
+  uncapToggle.onclick = () => {
+    uncapped = !uncapped;
+    wr.set_uncapped(uncapped);
+    uncapToggle.classList.toggle('active', uncapped);
+  };
+  addEventListener('keydown', (e) => {
+    if (e.key === '~' || e.key === '`') setDebug(!debugPanel.classList.contains('open'));
+  });
+
+  const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const bytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB'
+    : n >= 1024 ? (n / 1024).toFixed(0) + ' KB' : n + ' B';
+
+  function rows(pairs) {
+    return '<div class="kv">' + pairs.map(([k, v, cls]) =>
+      `<span>${esc(k)}</span><span class="${cls || ''}">${esc(v)}</span>`).join('') + '</div>';
+  }
+
+  function meter(used, cap) {
+    const frac = cap > 0 ? used / cap : 0;
+    const cls = frac > 0.95 ? 'bad' : frac > 0.8 ? 'warn' : '';
+    return `<div class="meter ${cls}"><i style="width:${(frac * 100).toFixed(1)}%"></i></div>`;
+  }
+
+  function section(title, html) {
+    return `<div class="sec"><h3>${esc(title)}</h3>${html}</div>`;
+  }
+
+  const prev = { t: performance.now(), v: {} };
+  function rate(name, value) {
+    const now = performance.now();
+    const dt = (now - prev.t) / 1000;
+    const last = prev.v[name];
+    prev.v[name] = value;
+    if (last === undefined || dt <= 0) return 0;
+    return (value - last) / dt;
+  }
+
+  function render(d) {
+    if (!d.frame) return;
+    const evictRate = rate('mesh_evict', d.upload.meshEvictions) + rate('img_evict', d.upload.imageryEvictions);
+    const stallRate = rate('stalls', d.upload.stalls);
+    const dropRate = rate('dropped', d.upload.dropped);
+    prev.t = performance.now();
+
+    const thrash = evictRate > 20 ? 'bad' : evictRate > 5 ? 'warn' : 'ok';
+    const meshFull = d.arena.meshUsed / d.arena.meshCap > 0.9;
+    const layerFull = d.arena.layerUsed / d.arena.layerCap > 0.9;
+    const starved = (meshFull && d.tree.evictableMesh === 0) || (layerFull && d.tree.evictableImagery === 0);
+    const admit = d.draw.visited / Math.max(1, d.draw.drawn);
+
+    const html = [
+      section('Frame', rows([
+        ['fps (presented)', d.frame.fps.toFixed(1), d.frame.fps < 30 ? 'warn' : ''],
+        ['fps (cpu ceiling)', d.frame.uncappedFps, d.frame.uncappedFps < 60 ? 'warn' : 'ok'],
+        ['cpu ms', d.frame.ms.toFixed(2), d.frame.ms > 16 ? 'warn' : ''],
+        ['cpu ms avg', d.frame.msAvg.toFixed(2)],
+        ['loop', d.frame.uncapped ? 'uncapped' : 'vsync (raf)'],
+        ['canvas', `${d.frame.width}x${d.frame.height}`],
+        ['res scale', d.frame.scale.toFixed(2)],
+      ])),
+
+      section('Camera', rows([
+        ['lon / lat', `${d.camera.lon.toFixed(4)} ${d.camera.lat.toFixed(4)}`],
+        ['altitude', (d.camera.alt / 1000).toFixed(2) + ' km'],
+        ['distance', (d.camera.distance / 1000).toFixed(2) + ' km'],
+        ['heading / tilt', `${d.camera.heading.toFixed(0)}° ${d.camera.tilt.toFixed(0)}°`],
+        ['ground', d.camera.clearance.toFixed(0) + ' m'],
+      ])),
+
+      section('LOD', rows([
+        ['drawn tiles', `${d.draw.drawn} / ${d.draw.maxDrawn}`],
+        ['level span', `z${d.draw.minLevel} – z${d.draw.maxLevel}`],
+        ['frustum pass / cull', `${d.draw.visited} / ${d.draw.culled}`],
+        ['admit ratio', admit.toFixed(2) + 'x', admit > 3 ? 'bad' : admit > 2 ? 'warn' : 'ok'],
+        ['splits', d.draw.splits],
+        ['starved splits', d.draw.starvedSplits, d.draw.starvedSplits > 0 ? 'warn' : 'ok'],
+        ['blocked (arena full)', d.draw.blockedSplits, d.draw.blockedSplits > 0 ? 'bad' : 'ok'],
+      ])),
+
+      section('Tile tree', rows([
+        ['tracked tiles', d.tree.tiles],
+        ['resident mesh', d.tree.meshes],
+        ['resident imagery', d.tree.imagery],
+        ['inbound m / i', `${d.tree.meshInbound} / ${d.tree.imageryInbound}`],
+        ['failed m / i', `${d.tree.meshFailed} / ${d.tree.imageryFailed}`,
+          d.tree.meshFailed + d.tree.imageryFailed > 0 ? 'warn' : ''],
+        ['split nodes', d.tree.split],
+        ['eviction-locked', d.tree.protected],
+        ['evictable m / i', `${d.tree.evictableMesh} / ${d.tree.evictableImagery}`,
+          starved ? 'bad' : ''],
+      ])),
+
+      section('GPU arena',
+        rows([['mesh slots', `${d.arena.meshUsed} / ${d.arena.meshCap}`]]) +
+        meter(d.arena.meshUsed, d.arena.meshCap) +
+        rows([['imagery layers', `${d.arena.layerUsed} / ${d.arena.layerCap}`]]) +
+        meter(d.arena.layerUsed, d.arena.layerCap)),
+
+      section('Upload', rows([
+        ['this frame', `${bytes(d.upload.bytes)} / ${bytes(d.upload.budget)}`],
+        ['deferred queue', d.upload.deferred, d.upload.deferred > 16 ? 'warn' : ''],
+        ['evictions/s', evictRate.toFixed(1), thrash],
+        ['stalls/s', stallRate.toFixed(1), stallRate > 1 ? 'bad' : 'ok'],
+        ['dropped/s', dropRate.toFixed(1), dropRate > 1 ? 'warn' : 'ok'],
+        ['evicted m / i', `${d.upload.meshEvictions} / ${d.upload.imageryEvictions}`],
+        ['retired m / i', `${d.upload.retiredMeshes} / ${d.upload.retiredImagery}`],
+        ['camera jumped', d.upload.cameraJumped ? 'yes' : 'no'],
+      ])),
+
+      section('Worker pool', rows([
+        ['in flight', d.pool.active],
+        ['terrain / imagery', `${d.pool.terrain} / ${d.pool.imagery}`],
+        ['queued last frame', d.pool.queueDepth],
+        ['sent / dropped', `${d.pool.sent} / ${d.pool.dropped}`, d.pool.dropped > 0 ? 'warn' : ''],
+        ['inbox', d.pool.inbox],
+        ['dispatched total', d.pool.dispatched],
+      ]) + '<table><thead><tr><th>worker</th><th>state</th><th>jobs</th></tr></thead><tbody>' +
+        d.workers.map((w, i) =>
+          `<tr><td>#${i}</td><td class="${w.ready ? 'dim' : 'hot'}">${w.ready ? 'ready' : 'boot'}</td>` +
+          `<td>${w.inFlight} / ${d.pool.maxInFlight}</td></tr>`).join('') +
+        '</tbody></table>'),
+
+      section('Per level',
+        '<table><thead><tr><th>z</th><th>mesh</th><th>img</th><th>drawn</th><th>pend</th></tr></thead><tbody>' +
+        d.levels.map((l) =>
+          `<tr><td>z${l.z}</td><td>${l.meshes}</td><td>${l.imagery}</td>` +
+          `<td class="${l.drawn ? '' : 'dim'}">${l.drawn}</td>` +
+          `<td class="${l.pending ? 'hot' : 'dim'}">${l.pending}</td></tr>`).join('') +
+        '</tbody></table>'),
+
+      section('Scene', rows([
+        ['polygons', d.scene.polygons],
+        ['lines', d.scene.lines],
+        ['icon batches', d.scene.icons],
+        ['models', `${d.scene.modelsReady} / ${d.scene.models}`],
+        ['model instances', d.scene.modelInstances],
+        ['flights', d.scene.flights],
+      ])),
+    ].join('');
+
+    debugBody.innerHTML = html;
+  }
+
+  setInterval(() => {
+    const c = wr.camera_state();
+    hud.textContent = wr.stats() + '\n' +
+      `lon ${c[0].toFixed(3)}  lat ${c[1].toFixed(3)}  alt ${(c[5] / 1000).toFixed(1)} km  ` +
+      `hdg ${c[3].toFixed(0)}  tilt ${c[4].toFixed(0)}`;
+    if (debugPanel.classList.contains('open')) {
+      try { render(JSON.parse(wr.debug_json())); } catch (e) { debugBody.textContent = String(e); }
+    }
+  }, 200);
+}
+</script>
+</body>
+</html>

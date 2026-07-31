@@ -1,0 +1,769 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WorldRenderer tests</title>
+<style>
+  html, body { margin: 0; background: #06090f; color: #cfe3ff;
+    font: 12px/1.6 ui-monospace, Consolas, monospace; }
+  #stage { position: fixed; top: 0; right: 0; width: 640px; height: 480px;
+    border-left: 1px solid #1d2b42; border-bottom: 1px solid #1d2b42; }
+  #globe { width: 100%; height: 100%; display: block; touch-action: none; }
+  #out { padding: 12px 16px; margin-right: 660px; }
+  h1 { font-size: 14px; margin: 0 0 10px; }
+  .row { display: grid; grid-template-columns: 62px 1fr; gap: 8px; padding: 2px 0;
+    border-bottom: 1px solid #101a29; }
+  .pass { color: #6fe39a; }
+  .fail { color: #ff8080; }
+  .skip { color: #b9a05e; }
+  .detail { color: #7f93ad; }
+  #summary { margin: 12px 0; padding: 8px 10px; border: 1px solid #1d2b42; border-radius: 4px; }
+  #shots { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  #shots figure { margin: 0; }
+  #shots canvas { width: 150px; height: 150px; image-rendering: pixelated;
+    border: 1px solid #23374f; display: block; }
+  #shots figcaption { color: #7f93ad; font-size: 11px; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="globe"></canvas></div>
+<div id="out">
+  <h1>WorldRenderer behaviour tests</h1>
+  <div id="summary">running…</div>
+  <div id="results"></div>
+  <div id="shots"></div>
+</div>
+<script type="module">
+import init, * as wr from './pkg/worldrenderer.js';
+import { IMAGERY_SOURCES } from './sources.js';
+
+const results = document.getElementById('results');
+const summary = document.getElementById('summary');
+const shots = document.getElementById('shots');
+const consoleErrors = [];
+const origError = console.error.bind(console);
+console.error = (...a) => { consoleErrors.push(a.map(String).join(' ')); origError(...a); };
+window.addEventListener('error', e => consoleErrors.push('uncaught: ' + e.message));
+window.addEventListener('unhandledrejection', e => consoleErrors.push('rejection: ' + e.reason));
+
+const canvas = document.getElementById('globe');
+const state = { pass: 0, fail: 0, tests: [] };
+window.__results = state;
+
+function row(name, ok, detail) {
+  const div = document.createElement('div');
+  div.className = 'row';
+  div.innerHTML = `<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>` +
+    `<span>${name}<span class="detail"> ${detail ?? ''}</span></span>`;
+  results.appendChild(div);
+}
+
+async function test(name, fn) {
+  let ok = false, detail = '';
+  try {
+    detail = (await fn()) ?? '';
+    ok = true;
+    state.pass++;
+  } catch (e) {
+    detail = String(e && e.message ? e.message : e);
+    state.fail++;
+  }
+  let after = {};
+  try { after = JSON.parse(wr.stats_json()); } catch (e) {}
+  state.tests.push({ name, ok, detail, after });
+  row(name, ok, detail);
+  summary.textContent = `${state.pass} passed, ${state.fail} failed`;
+}
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+function near(a, b, tol, msg) {
+  if (Math.abs(a - b) > tol) throw new Error(`${msg}: ${a} vs ${b} (tol ${tol})`);
+}
+
+const frame = () => new Promise(r => {
+  const c = new MessageChannel();
+  c.port1.onmessage = () => r();
+  c.port2.postMessage(0);
+});
+
+async function steps(n, dt = 1 / 60) {
+  for (let i = 0; i < n; i++) {
+    wr.tick_step(dt);
+    await frame();
+  }
+}
+
+async function settleTiles(maxMs = 12000, wantLevel = 0) {
+  const t0 = performance.now();
+  let quietSince = null;
+  while (performance.now() - t0 < maxMs) {
+    wr.tick_step(1 / 60);
+    await frame();
+    const s = JSON.parse(wr.stats_json());
+    const idle = s.meshes > 0 && s.inFlight === 0 && s.deferredUploads === 0 &&
+      s.maxLevel >= wantLevel;
+    if (idle) {
+      if (quietSince === null) quietSince = performance.now();
+      if (performance.now() - quietSince > 400) return s;
+    } else {
+      quietSince = null;
+    }
+  }
+  return JSON.parse(wr.stats_json());
+}
+
+function stats() { return JSON.parse(wr.stats_json()); }
+function cam() {
+  const c = wr.camera_state();
+  return { lon: c[0], lat: c[1], distance: c[2], heading: c[3], tilt: c[4], altitude: c[5] };
+}
+
+async function shot(label, size = 150) {
+  const px = await wr.read_pixels(size);
+  const fig = document.createElement('figure');
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(px), size, size), 0, 0);
+  const cap = document.createElement('figcaption');
+  cap.textContent = label;
+  fig.append(c, cap);
+  shots.appendChild(fig);
+  return px;
+}
+
+function isBackground(px, i) {
+  return Math.abs(px[i] - 2) <= 4 && Math.abs(px[i + 1] - 4) <= 5 &&
+    px[i + 2] >= 5 && px[i + 2] <= 17;
+}
+
+function analyse(px) {
+  let lit = 0, sum = [0, 0, 0];
+  const n = px.length / 4;
+  for (let i = 0; i < px.length; i += 4) {
+    if (!isBackground(px, i)) lit++;
+    sum[0] += px[i]; sum[1] += px[i + 1]; sum[2] += px[i + 2];
+  }
+  return { coverage: lit / n, avg: sum.map(v => Math.round(v / n)) };
+}
+
+function pointer(type, x, y, opts = {}) {
+  const rect = canvas.getBoundingClientRect();
+  canvas.dispatchEvent(new PointerEvent(type, {
+    clientX: rect.left + x, clientY: rect.top + y,
+    bubbles: true, cancelable: true, button: opts.button ?? 0,
+    buttons: opts.buttons ?? 1, shiftKey: !!opts.shift, pointerId: 1,
+  }));
+}
+
+function wheel(x, y, deltaY) {
+  const rect = canvas.getBoundingClientRect();
+  canvas.dispatchEvent(new WheelEvent('wheel', {
+    clientX: rect.left + x, clientY: rect.top + y,
+    deltaY, bubbles: true, cancelable: true,
+  }));
+}
+
+async function drag(x0, y0, x1, y1, opts = {}) {
+  pointer('pointerdown', x0, y0, opts);
+  const steps = 8;
+  for (let i = 1; i <= steps; i++) {
+    pointer('pointermove', x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps, opts);
+    wr.tick_step(1 / 60);
+    await frame();
+  }
+  pointer('pointerup', x1, y1, opts);
+  wr.tick_step(1 / 60);
+  await frame();
+}
+
+// ---------------------------------------------------------------- run
+
+if (!navigator.gpu) {
+  summary.textContent = 'WebGPU unavailable — cannot run tests.';
+} else {
+  await init();
+  await wr.start('globe');
+  wr.set_running(false);
+
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  const CX = W / 2, CY = H / 2;
+
+  await test('every shader compiles without errors', async () => {
+    const adapter = await navigator.gpu.requestAdapter();
+    const device = await adapter.requestDevice();
+    const names = ['terrain', 'polygon', 'line', 'icon', 'model'];
+    const problems = [];
+    for (const n of names) {
+      const res = await fetch(`./src/shaders/${n}.wgsl`);
+      if (!res.ok) { problems.push(`${n}: missing`); continue; }
+      const info = await device.createShaderModule({ code: await res.text() }).getCompilationInfo();
+      for (const m of info.messages) {
+        if (m.type === 'error') problems.push(`${n}:${m.lineNum} ${m.message}`);
+      }
+    }
+    device.destroy();
+    assert(problems.length === 0, problems.join(' | '));
+    return `${names.length} shaders compile clean`;
+  });
+
+  await test('start: renderer initialises and reports size', () => {
+    const s = stats();
+    assert(s.width > 0 && s.height > 0, 'canvas has no backing size');
+    return `${s.width}x${s.height}`;
+  });
+
+  await test('streaming: tiles load and nothing is left stuck in flight', async () => {
+    wr.jump_to(0, 15, 20000000);
+    const s = await settleTiles();
+    assert(s.meshes > 20, `only ${s.meshes} meshes resident`);
+    assert(s.inFlight === 0, `${s.inFlight} requests stuck in flight`);
+    return `${s.meshes} meshes, ${s.imagery} imagery, ${s.dispatched} dispatched`;
+  });
+
+  await test('globe coverage: whole visible disc is filled (no missing halves)', async () => {
+    wr.jump_to(0, 15, 20000000);
+    await settleTiles();
+    const px = await shot('whole earth', 200);
+    let nonzero = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i] > 0 || px[i + 1] > 0 || px[i + 2] > 0) nonzero++;
+    }
+    assert(nonzero > px.length / 4 * 0.99,
+      `frame is blank - only ${(nonzero / (px.length / 4) * 100).toFixed(1)}% of pixels were written`);
+    const a = analyse(px);
+    assert(a.coverage > 0.15, `only ${(a.coverage * 100).toFixed(1)}% of frame covered`);
+    return `${(a.coverage * 100).toFixed(1)}% covered, avg rgb ${a.avg}`;
+  });
+
+  await test('globe coverage: every quadrant of the disc has terrain', async () => {
+    const size = 200;
+    const px = await wr.read_pixels(size);
+    const quad = [0, 0, 0, 0];
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = (y * size + x) * 4;
+        if (!isBackground(px, i)) {
+          quad[(y < size / 2 ? 0 : 2) + (x < size / 2 ? 0 : 1)]++;
+        }
+      }
+    }
+    const min = Math.min(...quad), total = size * size / 4;
+    assert(min / total > 0.10, `weakest quadrant only ${(min / total * 100).toFixed(1)}% filled: ${quad}`);
+    return `quadrant fill ${quad.map(q => (q / total * 100).toFixed(0) + '%').join(' ')}`;
+  });
+
+  await test('backpressured requests are retried, not lost', async () => {
+    const s = stats();
+    assert(s.inFlight === 0, `${s.inFlight} still in flight after settling`);
+    assert(s.meshes >= 25, `only ${s.meshes} meshes resident for a whole-earth view`);
+    return `${s.dispatched} dispatched, ${s.dropped} backpressured then retried`;
+  });
+
+  await test('pick: screen centre maps back to the camera target', async () => {
+    wr.jump_to(10, 40, 3000000);
+    await steps(3);
+    const p = wr.pick(0, 0);
+    assert(p.length === 2, 'centre ray missed the globe');
+    near(p[0], 10, 0.5, 'picked lon');
+    near(p[1], 40, 0.5, 'picked lat');
+    return `pick(0,0) = ${p[0].toFixed(3)}, ${p[1].toFixed(3)}`;
+  });
+
+  await test('pick: ray off the limb returns nothing', async () => {
+    wr.jump_to(0, 0, 20000000);
+    await steps(3);
+    assert(wr.pick(0.98, 0.98).length === 0, 'corner ray should miss the globe');
+    return 'corner ray misses as expected';
+  });
+
+  await test('drag right moves the world right (not backwards)', async () => {
+    wr.jump_to(0, 0, 8000000);
+    await steps(5);
+    const before = cam();
+    await drag(CX - 120, CY, CX + 120, CY);
+    const after = cam();
+    assert(after.lon < before.lon - 1,
+      `dragging right should decrease camera lon, got ${before.lon} -> ${after.lon}`);
+    return `lon ${before.lon.toFixed(2)} -> ${after.lon.toFixed(2)}`;
+  });
+
+  await test('drag down moves the world down (not backwards)', async () => {
+    wr.jump_to(0, 0, 8000000);
+    await steps(5);
+    const before = cam();
+    await drag(CX, CY - 90, CX, CY + 90);
+    const after = cam();
+    assert(after.lat > before.lat + 1,
+      `dragging the map down should look further north, got ${before.lat} -> ${after.lat}`);
+    return `lat ${before.lat.toFixed(2)} -> ${after.lat.toFixed(2)}`;
+  });
+
+  await test('north is up in the default top-down view', async () => {
+    wr.jump_to(0, 20, 4000000);
+    wr.set_orientation(0, 0);
+    await steps(20);
+    const above = wr.pick(0, 0.5);
+    const right = wr.pick(0.5, 0);
+    assert(above.length === 2 && right.length === 2, 'reference rays missed the globe');
+    assert(above[1] > 20, `top of screen should be north, got lat ${above[1]}`);
+    assert(right[0] > 0, `right of screen should be east, got lon ${right[0]}`);
+    return `up = lat ${above[1].toFixed(1)}, right = lon ${right[0].toFixed(1)}`;
+  });
+
+  await test('drag: grabbed point stays under the cursor', async () => {
+    wr.jump_to(0, 0, 6000000);
+    await steps(5);
+    const startNdc = [-0.3, 0.2];
+    const grabbed = wr.pick(startNdc[0], startNdc[1]);
+    assert(grabbed.length === 2, 'grab point missed the globe');
+    const rect = canvas.getBoundingClientRect();
+    const px0 = (startNdc[0] + 1) / 2 * rect.width;
+    const py0 = (1 - startNdc[1]) / 2 * rect.height;
+    await drag(px0, py0, px0 + 100, py0 + 60);
+    const endNdc = [(px0 + 100) / rect.width * 2 - 1, 1 - (py0 + 60) / rect.height * 2];
+    const under = wr.pick(endNdc[0], endNdc[1]);
+    assert(under.length === 2, 'end point missed the globe');
+    near(under[0], grabbed[0], 1.5, 'grabbed lon drifted');
+    near(under[1], grabbed[1], 1.5, 'grabbed lat drifted');
+    return `drift ${Math.abs(under[0] - grabbed[0]).toFixed(3)}, ${Math.abs(under[1] - grabbed[1]).toFixed(3)} deg`;
+  });
+
+  await test('drag stays exact when the view is rotated and tilted', async () => {
+    for (const [heading, tilt] of [[90, 0], [180, 30], [250, 60]]) {
+      wr.jump_to(12, 30, 900000);
+      wr.set_orientation(heading, tilt);
+      await steps(60);
+      const startNdc = [-0.25, 0.15];
+      const grabbed = wr.pick(startNdc[0], startNdc[1]);
+      assert(grabbed.length === 2, `grab missed the globe at heading ${heading}`);
+      const rect = canvas.getBoundingClientRect();
+      const px0 = (startNdc[0] + 1) / 2 * rect.width;
+      const py0 = (1 - startNdc[1]) / 2 * rect.height;
+      await drag(px0, py0, px0 + 110, py0 + 40);
+      const endNdc = [(px0 + 110) / rect.width * 2 - 1, 1 - (py0 + 40) / rect.height * 2];
+      const under = wr.pick(endNdc[0], endNdc[1]);
+      assert(under.length === 2, `end point missed the globe at heading ${heading}`);
+      near(under[0], grabbed[0], 1.0, `lon drifted at heading ${heading}`);
+      near(under[1], grabbed[1], 1.0, `lat drifted at heading ${heading}`);
+    }
+    return 'grabbed point tracks the cursor at heading 90/180/250';
+  });
+
+  await test('wheel zooms in and settles at the new distance', async () => {
+    wr.jump_to(0, 0, 8000000);
+    wr.set_orientation(0, 0);
+    await steps(20);
+    const before = cam().distance;
+    wheel(CX, CY, -500);
+    await steps(40);
+    const after = cam().distance;
+    assert(after < before * 0.9, `distance ${before} -> ${after}`);
+    return `${(before / 1000).toFixed(0)} km -> ${(after / 1000).toFixed(0)} km`;
+  });
+
+  await test('wheel zooms toward the cursor, not the centre', async () => {
+    wr.jump_to(0, 0, 8000000);
+    wr.set_orientation(0, 0);
+    await steps(20);
+    const target = wr.pick(0.5, 0.0);
+    const before = cam();
+    wheel(CX + W * 0.25, CY, -600);
+    await steps(60);
+    const after = cam();
+    assert(Math.abs(after.lon - target[0]) < Math.abs(before.lon - target[0]),
+      `camera did not move toward cursor lon ${target[0]}`);
+    return `lon ${before.lon.toFixed(2)} -> ${after.lon.toFixed(2)} (cursor at ${target[0].toFixed(2)})`;
+  });
+
+  await test('wheel out increases distance', async () => {
+    wr.jump_to(0, 0, 4000000);
+    wr.set_orientation(0, 0);
+    await steps(20);
+    const before = cam().distance;
+    wheel(CX, CY, 600);
+    await steps(40);
+    assert(cam().distance > before * 1.1, 'zoom out did nothing');
+    return `${(before / 1000).toFixed(0)} km -> ${(cam().distance / 1000).toFixed(0)} km`;
+  });
+
+  await test('shift-drag tilts the camera', async () => {
+    wr.jump_to(6.8652, 45.8326, 200000);
+    wr.set_orientation(0, 0);
+    await steps(30);
+    const before = cam().tilt;
+    await drag(CX, CY + 100, CX, CY - 40, { shift: true, button: 2, buttons: 2 });
+    await steps(30);
+    const after = cam().tilt;
+    assert(after > before + 5, `dragging up should tilt toward the horizon, tilt ${before} -> ${after}`);
+    return `tilt ${before.toFixed(1)} -> ${after.toFixed(1)} deg`;
+  });
+
+  await test('shift-drag rotates the heading', async () => {
+    wr.set_orientation(0, 45);
+    await steps(30);
+    const before = cam().heading;
+    await drag(CX - 100, CY, CX + 100, CY, { shift: true, button: 2, buttons: 2 });
+    await steps(30);
+    const after = cam().heading;
+    assert(after < before - 20,
+      `dragging right should swing the view right (heading down), got ${before} -> ${after}`);
+    return `heading ${before.toFixed(0)} -> ${after.toFixed(0)} deg`;
+  });
+
+  await test('tilted view still renders terrain', async () => {
+    wr.jump_to(6.8652, 45.8326, 60000);
+    wr.set_orientation(0, 65);
+    await settleTiles(15000, 10);
+    const a = analyse(await shot('tilted terrain'));
+    assert(a.coverage > 0.4, `tilted view ${(a.coverage * 100).toFixed(1)}% covered`);
+    return `${(a.coverage * 100).toFixed(1)}% covered`;
+  });
+
+  await test('LOD: zooming in raises the drawn tile level', async () => {
+    wr.jump_to(0, 15, 20000000);
+    await settleTiles(8000);
+    const wide = stats().maxLevel;
+    wr.jump_to(6.8652, 45.8326, 40000);
+    const close = (await settleTiles(20000, wide + 3)).maxLevel;
+    assert(close > wide, `level ${wide} -> ${close}`);
+    return `z${wide} wide -> z${close} close`;
+  });
+
+  await test('terrain relief is visible at close range', async () => {
+    wr.set_orientation(0, 0);
+    await settleTiles(20000, 11);
+    const a = analyse(await shot('mont blanc'));
+    assert(a.coverage > 0.995, `close view has holes: ${((1 - a.coverage) * 100).toFixed(2)}% background`);
+    const px = await wr.read_pixels(120);
+    let min = 255, max = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      const l = (px[i] + px[i + 1] + px[i + 2]) / 3;
+      min = Math.min(min, l); max = Math.max(max, l);
+    }
+    assert(max - min > 30, `frame is flat, luminance range ${max - min}`);
+    return `luminance range ${min}-${max}`;
+  });
+
+  await test('antimeridian: tiles load across the 180 deg seam', async () => {
+    wr.jump_to(179.6, -17.0, 300000);
+    const s = await settleTiles(15000, 8);
+    assert(s.meshes > 10, `only ${s.meshes} meshes near the antimeridian`);
+    const a = analyse(await shot('antimeridian'));
+    assert(a.coverage > 0.6, `seam view ${(a.coverage * 100).toFixed(1)}% covered`);
+    return `${s.meshes} meshes, ${(a.coverage * 100).toFixed(0)}% covered`;
+  });
+
+  await test('high latitude: tiles load near the mercator limit', async () => {
+    wr.jump_to(-19.0, 64.9, 400000);
+    const s = await settleTiles(15000, 8);
+    assert(s.meshes > 10, `only ${s.meshes} meshes at high latitude`);
+    const a = analyse(await shot('iceland'));
+    assert(a.coverage > 0.6, `high-lat view ${(a.coverage * 100).toFixed(1)}% covered`);
+    return `${s.meshes} meshes at lat ${cam().lat.toFixed(1)}`;
+  });
+
+  await test('southern hemisphere renders', async () => {
+    wr.jump_to(-70.0109, -32.6532, 200000);
+    const s = await settleTiles(15000, 8);
+    const a = analyse(await shot('andes'));
+    assert(a.coverage > 0.6, `southern view ${(a.coverage * 100).toFixed(1)}% covered`);
+    return `${s.meshes} meshes, ${(a.coverage * 100).toFixed(0)}% covered`;
+  });
+
+  await test('upload budget is respected every frame', async () => {
+    wr.jump_to(86.925, 27.9881, 90000);
+    let peak = 0;
+    for (let i = 0; i < 200; i++) {
+      wr.tick_step(1 / 60);
+      await frame();
+      peak = Math.max(peak, stats().uploadedBytes);
+    }
+    assert(peak <= 3 * 1024 * 1024, `frame uploaded ${peak} bytes, over the 3 MiB budget`);
+    return `peak ${(peak / 1024 / 1024).toFixed(2)} MiB per frame`;
+  });
+
+  await test('frame time stays low while streaming', async () => {
+    wr.jump_to(-112.1129, 36.1069, 45000);
+    let worst = 0;
+    for (let i = 0; i < 150; i++) {
+      wr.tick_step(1 / 60);
+      await frame();
+      worst = Math.max(worst, stats().frameMs);
+    }
+    assert(worst < 50, `worst frame ${worst.toFixed(1)} ms`);
+    return `worst frame ${worst.toFixed(1)} ms`;
+  });
+
+  await test('no GPU slot or layer leaks after heavy navigation', async () => {
+    const s = stats();
+    assert(s.meshSlots === s.meshes,
+      `${s.meshSlots} mesh slots held but only ${s.meshes} tiles resident`);
+    assert(s.imageryLayers === s.imagery,
+      `${s.imageryLayers} imagery layers held but only ${s.imagery} tiles resident`);
+    assert(s.deferredUploads < 200, `${s.deferredUploads} uploads backed up`);
+    return `${s.meshes} meshes = ${s.meshSlots} slots, ${s.imagery} imagery = ${s.imageryLayers} layers`;
+  });
+
+  await test('vector layers: polygon, line and icons draw', async () => {
+    wr.clear_vectors();
+    wr.jump_to(6.87, 45.83, 40000);
+    await settleTiles(15000, 10);
+    const before = await wr.read_pixels(160);
+    wr.add_polygon(new Float64Array([6.84, 45.81, 6.90, 45.81, 6.90, 45.85, 6.84, 45.85]),
+      1000, 3000, 0xff2020ff);
+    wr.add_line(new Float64Array([6.80, 45.80, 4000, 6.95, 45.86, 4000]), 6, 0x00ffffff);
+    wr.add_icons(new Float64Array([6.87, 45.83, 5000]), 40, 0xffff00ff);
+    assert(wr.vector_batches() === 3, `expected 3 batches, got ${wr.vector_batches()}`);
+    await steps(4);
+    const after = await shot('vectors', 160);
+    let changed = 0;
+    for (let i = 0; i < before.length; i += 4) {
+      if (Math.abs(before[i] - after[i]) + Math.abs(before[i + 1] - after[i + 1]) +
+          Math.abs(before[i + 2] - after[i + 2]) > 30) changed++;
+    }
+    const pct = changed / (before.length / 4) * 100;
+    assert(pct > 0.5, `vector layers changed only ${pct.toFixed(2)}% of the frame`);
+    return `${pct.toFixed(1)}% of pixels changed`;
+  });
+
+  await test('clear_vectors removes them again', async () => {
+    wr.clear_vectors();
+    assert(wr.vector_batches() === 0, 'batches remain after clear');
+    await steps(4);
+    return '0 batches';
+  });
+
+  await test('imagery source can be swapped at runtime', async () => {
+    const s2 = IMAGERY_SOURCES.find(s => s.name.includes('Sentinel-2'));
+    wr.set_imagery(s2.url, s2.maxZoom);
+    assert(stats().imagery === 0, 'old imagery was not released');
+    wr.jump_to(6.8652, 45.8326, 60000);
+    const after = await settleTiles(20000, 10);
+    assert(after.imagery > 5, `only ${after.imagery} tiles from the new source`);
+    await shot('sentinel-2');
+    return `${after.imagery} tiles at z${after.maxLevel}`;
+  });
+
+  await test('imagery falls back to an ancestor beyond its max zoom', async () => {
+    const blue = IMAGERY_SOURCES.find(s => s.name.includes('Blue Marble'));
+    wr.set_imagery(blue.url, blue.maxZoom);
+    wr.jump_to(6.8652, 45.8326, 30000);
+    wr.set_orientation(0, 0);
+    let s = await settleTiles(20000, 11);
+    s = await settleTiles(20000, s.maxLevel);
+    assert(s.maxLevel > blue.maxZoom, `terrain only reached z${s.maxLevel}`);
+    const a = analyse(await shot('imagery fallback'));
+    assert(a.coverage > 0.99, `fallback view has holes: ${((1 - a.coverage) * 100).toFixed(2)}% background`);
+    return `terrain z${s.maxLevel} over imagery z${blue.maxZoom}`;
+  });
+
+  await test('canvas resize keeps rendering', async () => {
+    const stage = document.getElementById('stage');
+    stage.style.width = '420px';
+    stage.style.height = '320px';
+    await steps(6);
+    const small = stats();
+    assert(small.width > 0 && small.height > 0, 'no size after shrink');
+    const a = analyse(await wr.read_pixels(120));
+    assert(a.coverage > 0.5, 'frame empty after resize');
+    stage.style.width = '640px';
+    stage.style.height = '480px';
+    await steps(6);
+    return `${small.width}x${small.height} -> ${stats().width}x${stats().height}`;
+  });
+
+  await test('keyboard flight moves the camera', async () => {
+    wr.jump_to(0, 0, 500000);
+    await steps(5);
+    const before = cam();
+    window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true }));
+    await steps(30);
+    window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true }));
+    await steps(20);
+    const after = cam();
+    assert(Math.abs(after.lat - before.lat) > 0.001, `lat ${before.lat} -> ${after.lat}`);
+    return `lat ${before.lat.toFixed(4)} -> ${after.lat.toFixed(4)}`;
+  });
+
+  await test('fly_to eases while jump_to is immediate', async () => {
+    wr.jump_to(0, 0, 5000000);
+    await steps(2);
+    wr.fly_to(40, 30, 5000000);
+    wr.tick_step(1 / 60);
+    const mid = cam();
+    assert(mid.lon > 0.01 && mid.lon < 39, `fly_to should ease, jumped to ${mid.lon}`);
+    await steps(120);
+    near(cam().lon, 40, 0.6, 'fly_to did not arrive');
+    wr.jump_to(-20, 10, 5000000);
+    wr.tick_step(1 / 60);
+    near(cam().lon, -20, 0.001, 'jump_to was not immediate');
+    return `eased through ${mid.lon.toFixed(2)} then arrived`;
+  });
+
+  await test('camera stays clamped at the poles and zoom limits', async () => {
+    wr.jump_to(0, 89.9, 1000);
+    await steps(10);
+    const c = cam();
+    assert(Math.abs(c.lat) <= 85.1, `lat not clamped: ${c.lat}`);
+    assert(c.distance >= 29.9, `distance not clamped: ${c.distance}`);
+    assert(Number.isFinite(c.altitude), 'altitude is not finite');
+    return `lat ${c.lat.toFixed(2)}, distance ${c.distance.toFixed(0)} m`;
+  });
+
+  await test('no holes or cracks between terrain tiles', async () => {
+    for (const [lon, lat, dist, tilt] of [
+      [6.8652, 45.8326, 40000, 0],
+      [-112.1129, 36.1069, 25000, 0],
+      [86.925, 27.9881, 90000, 55],
+    ]) {
+      wr.jump_to(lon, lat, dist);
+      wr.set_orientation(0, tilt);
+      await settleTiles(20000, 11);
+      const px = await wr.read_pixels(256);
+      let bg = 0;
+      for (let i = 0; i < px.length; i += 4) if (isBackground(px, i)) bg++;
+      const pct = bg / (px.length / 4) * 100;
+      const limit = tilt > 30 ? 60 : 0.3;
+      assert(pct < limit,
+        `${pct.toFixed(2)}% background at ${lon},${lat} tilt ${tilt} (limit ${limit}%)`);
+    }
+    return 'no background bleed-through between tiles';
+  });
+
+  await test('camera cannot fly through the ground', async () => {
+    wr.jump_to(86.925, 27.9881, 60000);
+    wr.set_orientation(0, 0);
+    await settleTiles(20000, 12);
+    let worst = Infinity;
+    for (const [heading, tilt] of [[0, 85], [90, 80], [200, 83]]) {
+      wr.set_orientation(heading, tilt);
+      wr.fly_to(86.925, 27.9881, 30);
+      await steps(180);
+      const s = stats();
+      const c = cam();
+      worst = Math.min(worst, c.altitude - s.groundHeight);
+      assert(c.altitude > s.groundHeight,
+        `eye at ${c.altitude.toFixed(0)} m is below ground ${s.groundHeight.toFixed(0)} m ` +
+        `(heading ${heading}, tilt ${tilt})`);
+      assert(c.altitude - s.groundHeight < 2000,
+        `clamp is too aggressive: ${(c.altitude - s.groundHeight).toFixed(0)} m above ground`);
+    }
+    return `closest approach ${worst.toFixed(1)} m above terrain`;
+  });
+
+  await test('glTF model loads from .glb', async () => {
+    const id = wr.add_model('./assets/plane.glb');
+    assert(id >= 0, 'add_model rejected the url');
+    const t0 = performance.now();
+    while (performance.now() - t0 < 15000 && !wr.model_ready(id)) {
+      wr.tick_step(1 / 60);
+      await frame();
+    }
+    assert(wr.model_ready(id), 'model never became ready');
+    return `model ${id} ready in ${Math.round(performance.now() - t0)} ms`;
+  });
+
+  await test('models fly along a route and render', async () => {
+    wr.clear_flights();
+    const route = [-0.45, 51.47, 9000, 0.6, 51.9, 9000, -0.45, 51.47, 9000];
+    const f = wr.add_flight(0, new Float64Array(route), 900, 2500, 0xffe08aff);
+    assert(f >= 0, 'add_flight failed');
+    assert(wr.model_instances(0) > 0, 'no instance was created');
+    const before = Array.from(wr.flight_position(0));
+    await steps(120);
+    const after = Array.from(wr.flight_position(0));
+    const moved = Math.abs(after[0] - before[0]) + Math.abs(after[1] - before[1]);
+    assert(moved > 0.001, `aircraft did not move: ${before} -> ${after}`);
+
+    wr.clear_flights();
+    const parked = [6.87, 45.83, 9000, 6.88, 45.83, 9000];
+    wr.add_flight(0, new Float64Array(parked), 0, 2500, 0xffe08aff);
+    wr.jump_to(6.87, 45.83 - 0.22, 24000);
+    wr.set_orientation(0, 65);
+    await settleTiles(15000, 8);
+    await steps(10);
+    const px = await shot('aircraft');
+    let warm = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i] > 150 && px[i + 1] > 120 && px[i + 2] < px[i + 1] - 30) warm++;
+    }
+    assert(warm > 8, `aircraft not visible (${warm} lit pixels)`);
+    return `moved ${moved.toFixed(4)} deg, ${warm} pixels of aircraft on screen`;
+  });
+
+  await test('geomorph blends tiles toward their parent instead of popping', async () => {
+    wr.clear_flights();
+    wr.jump_to(6.8652, 45.8326, 30000);
+    wr.set_orientation(0, 0);
+    await settleTiles(20000, 11);
+    const frames = [];
+    for (let i = 0; i < 26; i++) {
+      wr.fly_to(6.8652, 45.8326, 30000 * Math.pow(1.06, i));
+      await steps(6);
+      frames.push(await wr.read_pixels(64));
+    }
+    let worst = 0;
+    for (let i = 1; i < frames.length; i++) {
+      let diff = 0;
+      const a = frames[i - 1], b = frames[i];
+      for (let k = 0; k < a.length; k += 4) {
+        diff += Math.abs(a[k] - b[k]) + Math.abs(a[k + 1] - b[k + 1]) + Math.abs(a[k + 2] - b[k + 2]);
+      }
+      worst = Math.max(worst, diff / (a.length / 4) / 3);
+    }
+    assert(worst < 26, `frame-to-frame jump of ${worst.toFixed(1)} luminance levels looks like a pop`);
+    return `worst step ${worst.toFixed(1)} levels while zooming through LOD changes`;
+  });
+
+  await test('a loaded-up arena releases old tiles when the camera moves', async () => {
+    wr.clear_flights();
+    const dbg = () => JSON.parse(wr.debug_json());
+    const before = dbg().upload;
+
+    wr.jump_to(6.60, 45.83, 9000);
+    wr.set_orientation(90, 60);
+    await settleTiles(12000, 11);
+
+    let peakMesh = 0, peakLayer = 0, worstDeferred = 0;
+    for (let i = 0; i < 14; i++) {
+      wr.jump_to(6.60 + i * 0.06, 45.83, 9000);
+      await steps(14);
+      const d = dbg();
+      peakMesh = Math.max(peakMesh, d.arena.meshUsed / d.arena.meshCap);
+      peakLayer = Math.max(peakLayer, d.arena.layerUsed / d.arena.layerCap);
+      worstDeferred = Math.max(worstDeferred, d.upload.deferred);
+    }
+
+    wr.jump_to(86.925, 27.988, 25000);
+    wr.set_orientation(0, 45);
+    await settleTiles(15000, 9);
+
+    const d = dbg();
+    const retired = d.upload.retiredMeshes - before.retiredMeshes;
+    assert(retired > 0, 'no tiles were retired after the camera moved');
+    assert(d.draw.drawn > 0, 'nothing drawn at the new location');
+    assert(d.draw.maxLevel >= 9, `new location only reached z${d.draw.maxLevel}`);
+    assert(d.arena.meshUsed < d.arena.meshCap, 'mesh arena still completely full after moving');
+    assert(d.arena.layerUsed < d.arena.layerCap, 'imagery arena still completely full after moving');
+    assert(d.draw.blockedSplits === 0, 'refinement still blocked by arena pressure');
+    return `peak ${(peakMesh * 100).toFixed(0)}% mesh / ${(peakLayer * 100).toFixed(0)}% imagery, ` +
+      `worst deferred ${worstDeferred}, retired ${retired}, ` +
+      `new region z${d.draw.maxLevel} with ${d.draw.drawn} tiles`;
+  });
+
+  await test('no console errors, panics or GPU validation failures', () => {
+    assert(consoleErrors.length === 0, consoleErrors.slice(0, 3).join(' | '));
+    return 'clean';
+  });
+
+  wr.set_running(true);
+  summary.innerHTML = `<b class="${state.fail ? 'fail' : 'pass'}">` +
+    `${state.pass} passed, ${state.fail} failed</b>`;
+  window.__results = state;
+  window.__done = true;
+}
+</script>
+</body>
+</html>

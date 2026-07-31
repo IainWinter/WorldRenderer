@@ -1,0 +1,61 @@
+[package]
+name = "worldrenderer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wgpu = { version = "30", default-features = false, features = ["webgpu", "wgsl"] }
+wasm-bindgen = "0.2.126"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.33", features = ["bytemuck"] }
+png = "0.18"
+jpeg-decoder = "0.3"
+earcutr = "0.5"
+gltf = { version = "1", default-features = false, features = ["utils"] }
+console_error_panic_hook = "0.1"
+log = "0.4"
+console_log = "1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "Navigator",
+    "Performance",
+    "console",
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+    "MessageEvent",
+    "DedicatedWorkerGlobalScope",
+    "WorkerGlobalScope",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Blob",
+    "MouseEvent",
+    "WheelEvent",
+    "KeyboardEvent",
+    "PointerEvent",
+    "EventTarget",
+    "DomRect",
+    "AddEventListenerOptions",
+    "MessageChannel",
+    "MessagePort",
+    "CssStyleDeclaration",
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

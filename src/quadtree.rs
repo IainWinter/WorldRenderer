@@ -115,7 +115,7 @@ pub struct TileTree {
     pub retired_meshes: u64,
     pub retired_imagery: u64,
     pub camera_jumped: bool,
-    last_eye: DVec3,
+    last_anchor: DVec3,
     pub models: Vec<crate::stream::Incoming>,
 }
 
@@ -144,7 +144,7 @@ impl TileTree {
             retired_meshes: 0,
             retired_imagery: 0,
             camera_jumped: false,
-            last_eye: DVec3::ZERO,
+            last_anchor: DVec3::ZERO,
             models: Vec::new(),
         }
     }
@@ -252,6 +252,7 @@ impl TileTree {
             }
             tile.imagery_fails = 0;
             tile.imagery_retry_at = 0;
+            tile.imagery_at = 0;
         }
     }
 
@@ -267,10 +268,11 @@ impl TileTree {
         self.culled = 0;
         self.blocked_splits = 0;
 
-        let moved = (camera.eye - self.last_eye).length();
+        let anchor_now = camera.target();
+        let moved = (anchor_now - self.last_anchor).length();
         self.camera_jumped =
-            self.last_eye != DVec3::ZERO && moved > camera.distance * CAMERA_JUMP_FRACTION;
-        self.last_eye = camera.eye;
+            self.last_anchor != DVec3::ZERO && moved > camera.distance * CAMERA_JUMP_FRACTION;
+        self.last_anchor = anchor_now;
 
         let frustum = Frustum::from_view_proj(camera.view_proj);
         let k = screen_h as f64 / (2.0 * (camera.fov_y as f64 * 0.5).tan());
@@ -303,8 +305,23 @@ impl TileTree {
             let key = tile_at(lon, lat, z);
             let (center, radius) = key.bounding_sphere();
             let dist = ((center - camera.eye).length() - radius).max(1.0);
-            self.request_mesh(key, pool, -1000.0 + z as f32);
-            self.request_imagery(key, pool, -1000.0 + z as f32);
+            let n = 1u32 << z;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let nx = key.x as i32 + dx;
+                    let ny = key.y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx as u32 >= n || ny as u32 >= n {
+                        continue;
+                    }
+                    let nkey = TileKey {
+                        z,
+                        x: nx as u32,
+                        y: ny as u32,
+                    };
+                    self.request_mesh(nkey, pool, -1000.0 + z as f32);
+                    self.request_imagery(nkey, pool, -1000.0 + z as f32);
+                }
+            }
             if key.ground_extent() / dist * k <= TILE_PIXEL_TARGET {
                 break;
             }
@@ -372,28 +389,39 @@ impl TileTree {
 
         if want_children {
             let children: [TileKey; 4] = [key.child(0), key.child(1), key.child(2), key.child(3)];
-            let all_ready = children.iter().all(|c| {
-                self.renderable(*c)
-                    || self.exhausted(*c)
-                    || self.visible(*c, camera, frustum).is_none()
-            });
-            if all_ready {
+            let mut any_visible = false;
+            let mut all_visible_ready = true;
+            for c in children.iter() {
+                if self.visible(*c, camera, frustum).is_some() {
+                    any_visible = true;
+                    if !self.renderable(*c) && !self.exhausted(*c) {
+                        all_visible_ready = false;
+                    }
+                }
+            }
+            if any_visible && all_visible_ready {
                 self.splits += 1;
-                self.tiles.entry(key).or_default().split = true;
+                let frame = self.frame;
+                let parent = self.tiles.entry(key).or_default();
+                parent.split = true;
+                parent.last_used = frame;
+                parent.last_drawn = frame;
                 for c in children {
                     self.visit(c, camera, frustum, k, pool);
                 }
                 return;
             }
-            self.starved_splits += 1;
-            if self.mesh_pressure < ARENA_PRESSURE_LIMIT {
-                for c in children {
-                    if self.visible(c, camera, frustum).is_some() {
-                        self.request_mesh(c, pool, dist as f32 * 0.5);
+            if any_visible {
+                self.starved_splits += 1;
+                if self.mesh_pressure < ARENA_PRESSURE_LIMIT {
+                    for c in children {
+                        if self.visible(c, camera, frustum).is_some() {
+                            self.request_mesh(c, pool, dist as f32 * 0.5);
+                        }
                     }
+                } else {
+                    self.blocked_splits += 1;
                 }
-            } else {
-                self.blocked_splits += 1;
             }
         }
 

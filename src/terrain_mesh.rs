@@ -66,8 +66,8 @@ pub struct Heightmap {
 
 impl Heightmap {
     pub fn sample(&self, u: f64, v: f64) -> f64 {
-        let fx = (u * (self.w - 1) as f64).clamp(0.0, (self.w - 1) as f64);
-        let fy = (v * (self.h - 1) as f64).clamp(0.0, (self.h - 1) as f64);
+        let fx = (u * self.w as f64 - 0.5).clamp(0.0, (self.w - 1) as f64);
+        let fy = (v * self.h as f64 - 0.5).clamp(0.0, (self.h - 1) as f64);
         let x0 = fx.floor() as usize;
         let y0 = fy.floor() as usize;
         let x1 = (x0 + 1).min(self.w - 1);

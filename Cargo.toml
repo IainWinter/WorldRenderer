@@ -39,6 +39,8 @@ features = [
     "WorkerGlobalScope",
     "Request",
     "RequestInit",
+    "AbortController",
+    "AbortSignal",
     "RequestMode",
     "Response",
     "Blob",

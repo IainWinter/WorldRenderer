@@ -23,6 +23,7 @@ fn canonical(anchor: DQuat) -> DQuat {
     anchor_at(lon, lat.clamp(-MAX_LAT, MAX_LAT))
 }
 
+#[derive(Clone)]
 pub struct Camera {
     anchor: DQuat,
     target_anchor: DQuat,
@@ -112,14 +113,7 @@ impl Camera {
         self.tilt += (self.target_tilt - self.tilt) * k;
         self.distance = self.distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
 
-        self.orientation =
-            self.anchor * DQuat::from_rotation_z(self.heading) * DQuat::from_rotation_x(self.tilt);
-        self.eye = self.target() + (self.orientation * DVec3::Z) * self.distance;
-        let eye_dir = self.eye.normalize();
-        let floor = crate::math::ellipsoid_radius(eye_dir) + self.ground_clearance;
-        if self.eye.length() < floor {
-            self.eye = eye_dir * floor;
-        }
+        self.place_eye();
 
         self.view = Mat4::from_quat(self.orientation.as_quat()).transpose();
         let ground_dist = self.altitude().max(1.0);
@@ -181,31 +175,34 @@ impl Camera {
         self.grab = None;
     }
 
-    fn apply_rotation_preserving_view(&mut self, rotation: DQuat) {
-        let rotated = rotation * self.anchor;
-        let canon = canonical(rotated);
-        let mut delta = canon.inverse() * rotated;
-        if delta.w < 0.0 {
-            delta = -delta;
+    fn place_eye(&mut self) {
+        self.orientation =
+            self.anchor * DQuat::from_rotation_z(self.heading) * DQuat::from_rotation_x(self.tilt);
+        self.eye = self.target() + (self.orientation * DVec3::Z) * self.distance;
+        let eye_dir = self.eye.normalize();
+        let floor = crate::math::ellipsoid_radius(eye_dir) + self.ground_clearance;
+        if self.eye.length() < floor {
+            self.eye = eye_dir * floor;
         }
-        let twist = 2.0 * delta.z.atan2(delta.w);
-        self.anchor = canon;
-        self.target_anchor = canon;
-        self.heading += twist;
-        self.target_heading += twist;
     }
 
     pub fn grab_move(&mut self, ndc_x: f64, ndc_y: f64) -> bool {
         let Some(anchor_dir) = self.grab else {
             return false;
         };
-        let current = self.sphere_dir(ndc_x, ndc_y);
-        if current.dot(anchor_dir) > 0.999999 {
-            return false;
+        let mut moved = false;
+        for _ in 0..8 {
+            let current = self.sphere_dir(ndc_x, ndc_y);
+            if current.dot(anchor_dir) > 1.0 - 1e-14 {
+                break;
+            }
+            let rotation = DQuat::from_rotation_arc(current, anchor_dir);
+            self.anchor = canonical(rotation * self.anchor);
+            self.target_anchor = self.anchor;
+            self.place_eye();
+            moved = true;
         }
-        let rotation = DQuat::from_rotation_arc(current, anchor_dir);
-        self.apply_rotation_preserving_view(rotation);
-        true
+        moved
     }
 
     pub fn zoom_at(&mut self, ndc_x: f64, ndc_y: f64, delta: f64) {

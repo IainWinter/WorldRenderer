@@ -506,7 +506,7 @@ if (!navigator.gpu) {
     return `${s.meshes} meshes = ${s.meshSlots} slots, ${s.imagery} imagery = ${s.imageryLayers} layers`;
   });
 
-  await test('vector layers: polygon, line and icons draw', async () => {
+  await test('vector layers: polygon, tube, line and icons draw', async () => {
     wr.clear_vectors();
     wr.jump_to(6.87, 45.83, 40000);
     await settleTiles(15000, 10);
@@ -514,8 +514,10 @@ if (!navigator.gpu) {
     wr.add_polygon(new Float64Array([6.84, 45.81, 6.90, 45.81, 6.90, 45.85, 6.84, 45.85]),
       1000, 3000, 0xff2020ff);
     wr.add_line(new Float64Array([6.80, 45.80, 4000, 6.95, 45.86, 4000]), 6, 0x00ffffff);
-    wr.add_icons(new Float64Array([6.87, 45.83, 5000]), 40, 0xffff00ff);
-    assert(wr.vector_batches() === 3, `expected 3 batches, got ${wr.vector_batches()}`);
+    wr.add_tube(new Float64Array([6.82, 45.79, 3500, 6.87, 45.83, 4200, 6.93, 45.86, 3500]),
+      200, 10, 0x40ff80ff);
+    wr.add_icons(new Float64Array([6.87, 45.83, 5000]), 40, 0xffff00ff, 0);
+    assert(wr.vector_batches() === 4, `expected 4 batches, got ${wr.vector_batches()}`);
     await steps(4);
     const after = await shot('vectors', 160);
     let changed = 0;

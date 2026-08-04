@@ -1,4 +1,4 @@
-use crate::math::{geodetic_to_ecef, MIN_RADIUS};
+use crate::math::{geodetic_surface_normal, geodetic_to_ecef, MIN_RADIUS};
 use glam::DVec3;
 use std::cell::RefCell;
 
@@ -143,6 +143,40 @@ impl TileKey {
             radius = radius.max((*c - center).length());
         }
         (center, radius)
+    }
+
+    pub fn bounding_box(&self, h_min: f64, h_max: f64) -> (DVec3, [DVec3; 3], [f64; 3]) {
+        let (lon0, lat0, lon1, lat1) = self.lon_lat_bounds();
+        let lonm = (lon0 + lon1) * 0.5;
+        let latm = (lat0 + lat1) * 0.5;
+        let (sin_lon, cos_lon) = lonm.sin_cos();
+        let up = geodetic_surface_normal(lonm, latm);
+        let east = DVec3::new(-sin_lon, cos_lon, 0.0);
+        let axes = [east, up.cross(east), up];
+        let origin = geodetic_to_ecef(lonm, latm, 0.0);
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for lat in [lat0, latm, lat1] {
+            for lon in [lon0, lonm, lon1] {
+                let base = geodetic_to_ecef(lon, lat, 0.0) - origin;
+                let normal = geodetic_surface_normal(lon, lat);
+                for h in [h_min, h_max] {
+                    let p = base + normal * h;
+                    for i in 0..3 {
+                        let d = p.dot(axes[i]);
+                        lo[i] = lo[i].min(d);
+                        hi[i] = hi[i].max(d);
+                    }
+                }
+            }
+        }
+        let mut center = origin;
+        let mut half = [0.0f64; 3];
+        for i in 0..3 {
+            center += axes[i] * ((lo[i] + hi[i]) * 0.5);
+            half[i] = (hi[i] - lo[i]) * 0.5;
+        }
+        (center, axes, half)
     }
 
     pub fn ground_extent(&self) -> f64 {

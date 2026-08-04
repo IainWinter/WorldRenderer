@@ -3,7 +3,8 @@ use crate::math::{geodetic_surface_normal, geodetic_to_ecef};
 use glam::{DVec3, Vec3};
 
 pub const BATCH_STRIDE: u64 = 256;
-pub const MAX_BATCHES: u64 = 512;
+pub const MAX_BATCHES: u64 = 4096;
+pub const DEBUG_SLOT: u32 = MAX_BATCHES as u32 - 1;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -33,6 +34,7 @@ pub struct IconInstance {
 
 pub enum BatchKind {
     Polygon { indices: wgpu::Buffer, count: u32 },
+    Tube { indices: wgpu::Buffer, count: u32 },
     Line { count: u32 },
     Icon { count: u32 },
 }
@@ -42,6 +44,8 @@ pub struct Batch {
     pub buffer: wgpu::Buffer,
     pub kind: BatchKind,
     pub slot: u32,
+    pub vertices: u32,
+    pub triangles: u32,
 }
 
 pub struct VectorRenderer {
@@ -51,9 +55,15 @@ pub struct VectorRenderer {
     pub globals_bg: wgpu::BindGroup,
     pub batch_bg: wgpu::BindGroup,
     pub icon_bg: wgpu::BindGroup,
+    icon_layout: wgpu::BindGroupLayout,
+    icon_sampler: wgpu::Sampler,
     _icon_texture: wgpu::Texture,
+    pub icon_cols: u32,
+    pub icon_rows: u32,
+    pub icon_sheet_loaded: bool,
     pub batch_uniform: wgpu::Buffer,
     pub batches: Vec<Batch>,
+    pub debug: Option<Batch>,
     next_slot: u32,
 }
 
@@ -385,17 +395,155 @@ impl VectorRenderer {
             globals_bg,
             batch_bg,
             icon_bg,
+            icon_layout: bgl_icons,
+            icon_sampler,
             _icon_texture: icon_texture,
+            icon_cols: 1,
+            icon_rows: 1,
+            icon_sheet_loaded: false,
             batch_uniform,
             batches: Vec::new(),
+            debug: None,
             next_slot: 0,
         }
     }
 
+    pub fn set_icon_sheet(
+        &mut self,
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        cols: u32,
+        rows: u32,
+    ) {
+        if width == 0 || height == 0 || rgba.len() < (width * height * 4) as usize {
+            return;
+        }
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("icon sheet"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.icon_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("icon bg"),
+            layout: &self.icon_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.icon_sampler),
+                },
+            ],
+        });
+        self._icon_texture = texture;
+        self.icon_cols = cols.max(1);
+        self.icon_rows = rows.max(1);
+        self.icon_sheet_loaded = true;
+    }
+
+    pub fn icon_uv(&self, icon: u32) -> [f32; 4] {
+        let cells = self.icon_cols * self.icon_rows;
+        let i = if cells == 0 { 0 } else { icon % cells };
+        let col = i % self.icon_cols;
+        let row = i / self.icon_cols;
+        let w = 1.0 / self.icon_cols as f32;
+        let h = 1.0 / self.icon_rows as f32;
+        [col as f32 * w, row as f32 * h, w, h]
+    }
+
+    pub fn totals(&self) -> (u32, u32, u32, u32, u32, u32) {
+        let mut out = (0, 0, 0, 0, 0, 0);
+        for b in self.batches.iter() {
+            match b.kind {
+                BatchKind::Polygon { .. } => out.0 += 1,
+                BatchKind::Tube { .. } => out.1 += 1,
+                BatchKind::Line { .. } => out.2 += 1,
+                BatchKind::Icon { .. } => out.3 += 1,
+            }
+            out.4 += b.vertices;
+            out.5 += b.triangles;
+        }
+        out
+    }
+
     fn take_slot(&mut self) -> u32 {
         let slot = self.next_slot;
-        self.next_slot = (self.next_slot + 1) % MAX_BATCHES as u32;
+        self.next_slot = (self.next_slot + 1) % DEBUG_SLOT;
         slot
+    }
+
+    pub fn set_debug_lines(
+        &mut self,
+        gpu: &Gpu,
+        origin: DVec3,
+        segments: &[(DVec3, DVec3, u32)],
+        width: f32,
+    ) {
+        if segments.is_empty() {
+            self.debug = None;
+            return;
+        }
+        let items: Vec<LineInstance> = segments
+            .iter()
+            .map(|(a, b, color)| LineInstance {
+                a: (*a - origin).as_vec3().to_array(),
+                b: (*b - origin).as_vec3().to_array(),
+                color: unpack_color(*color),
+                width,
+            })
+            .collect();
+        let buffer = upload_buffer(
+            gpu,
+            "debug lines",
+            bytemuck::cast_slice(&items),
+            wgpu::BufferUsages::VERTEX,
+        );
+        let count = items.len() as u32;
+        self.debug = Some(Batch {
+            origin,
+            buffer,
+            kind: BatchKind::Line { count },
+            slot: DEBUG_SLOT,
+            vertices: count * 6,
+            triangles: count * 2,
+        });
+    }
+
+    pub fn clear_debug_lines(&mut self) {
+        self.debug = None;
     }
 
     pub fn clear(&mut self) {
@@ -501,6 +649,130 @@ impl VectorRenderer {
                 count: indices.len() as u32,
             },
             slot,
+            vertices: verts.len() as u32,
+            triangles: indices.len() as u32 / 3,
+        });
+        Some(self.batches.len() - 1)
+    }
+
+    pub fn add_tube(
+        &mut self,
+        gpu: &Gpu,
+        lonlath: &[f64],
+        radius: f64,
+        sides: u32,
+        color: u32,
+    ) -> Option<usize> {
+        let count = lonlath.len() / 3;
+        if count < 2 || radius <= 0.0 {
+            return None;
+        }
+        let sides = sides.clamp(3, 64) as usize;
+        let rgba = unpack_color(color);
+        let origin = geodetic_to_ecef(lonlath[0].to_radians(), lonlath[1].to_radians(), lonlath[2]);
+
+        let mut pts = Vec::with_capacity(count);
+        let mut ups = Vec::with_capacity(count);
+        for i in 0..count {
+            let lon = lonlath[i * 3].to_radians();
+            let lat = lonlath[i * 3 + 1].to_radians();
+            pts.push(geodetic_to_ecef(lon, lat, lonlath[i * 3 + 2]) - origin);
+            ups.push(geodetic_surface_normal(lon, lat));
+        }
+
+        let mut verts: Vec<PolyVertex> = Vec::with_capacity(count * sides + 2);
+        let mut indices: Vec<u32> = Vec::with_capacity(count * sides * 6);
+        let mut tangents = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let raw = if i == 0 {
+                pts[1] - pts[0]
+            } else if i == count - 1 {
+                pts[i] - pts[i - 1]
+            } else {
+                pts[i + 1] - pts[i - 1]
+            };
+            let tangent = if raw.length_squared() > 1e-12 {
+                raw.normalize()
+            } else {
+                ups[i].cross(DVec3::X).normalize()
+            };
+            let side = tangent.cross(ups[i]);
+            let side = if side.length_squared() > 1e-12 {
+                side.normalize()
+            } else {
+                tangent.cross(DVec3::Z).normalize()
+            };
+            let up = side.cross(tangent).normalize();
+            tangents.push(tangent);
+            for s in 0..sides {
+                let a = std::f64::consts::TAU * s as f64 / sides as f64;
+                let dir = side * a.cos() + up * a.sin();
+                verts.push(PolyVertex {
+                    pos: (pts[i] + dir * radius).as_vec3().to_array(),
+                    nrm: dir.as_vec3().to_array(),
+                    color: rgba,
+                });
+            }
+        }
+
+        for i in 0..count - 1 {
+            for s in 0..sides {
+                let n = (s + 1) % sides;
+                let a = (i * sides + s) as u32;
+                let b = (i * sides + n) as u32;
+                let c = ((i + 1) * sides + n) as u32;
+                let d = ((i + 1) * sides + s) as u32;
+                indices.extend_from_slice(&[a, b, c, a, c, d]);
+            }
+        }
+
+        for (end, ring) in [(0usize, 0usize), (1usize, count - 1)] {
+            let normal = if end == 0 {
+                -tangents[0]
+            } else {
+                tangents[ring]
+            };
+            let center = verts.len() as u32;
+            verts.push(PolyVertex {
+                pos: pts[ring].as_vec3().to_array(),
+                nrm: normal.as_vec3().to_array(),
+                color: rgba,
+            });
+            for s in 0..sides {
+                let a = (ring * sides + s) as u32;
+                let b = (ring * sides + (s + 1) % sides) as u32;
+                if end == 0 {
+                    indices.extend_from_slice(&[center, b, a]);
+                } else {
+                    indices.extend_from_slice(&[center, a, b]);
+                }
+            }
+        }
+
+        let vbuf = upload_buffer(
+            gpu,
+            "tube verts",
+            bytemuck::cast_slice(&verts),
+            wgpu::BufferUsages::VERTEX,
+        );
+        let ibuf = upload_buffer(
+            gpu,
+            "tube indices",
+            bytemuck::cast_slice(&indices),
+            wgpu::BufferUsages::INDEX,
+        );
+        let slot = self.take_slot();
+        self.batches.push(Batch {
+            origin,
+            buffer: vbuf,
+            kind: BatchKind::Tube {
+                indices: ibuf,
+                count: indices.len() as u32,
+            },
+            slot,
+            vertices: verts.len() as u32,
+            triangles: indices.len() as u32 / 3,
         });
         Some(self.batches.len() - 1)
     }
@@ -543,13 +815,16 @@ impl VectorRenderer {
             wgpu::BufferUsages::VERTEX,
         );
         let slot = self.take_slot();
+        let segment_count = segments.len() as u32;
         self.batches.push(Batch {
             origin,
             buffer,
             kind: BatchKind::Line {
-                count: segments.len() as u32,
+                count: segment_count,
             },
             slot,
+            vertices: segment_count * 6,
+            triangles: segment_count * 2,
         });
         Some(self.batches.len() - 1)
     }
@@ -560,12 +835,14 @@ impl VectorRenderer {
         lonlath: &[f64],
         size_px: f32,
         color: u32,
+        icon: u32,
     ) -> Option<usize> {
         let count = lonlath.len() / 3;
         if count == 0 {
             return None;
         }
         let rgba = unpack_color(color);
+        let uv_rect = self.icon_uv(icon);
         let origin = geodetic_to_ecef(lonlath[0].to_radians(), lonlath[1].to_radians(), lonlath[2]);
         let icons: Vec<IconInstance> = (0..count)
             .map(|i| {
@@ -577,7 +854,7 @@ impl VectorRenderer {
                 IconInstance {
                     pos: p.as_vec3().to_array(),
                     size: [size_px, size_px],
-                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                    uv_rect,
                     color: rgba,
                 }
             })
@@ -590,19 +867,20 @@ impl VectorRenderer {
             wgpu::BufferUsages::VERTEX,
         );
         let slot = self.take_slot();
+        let icon_count = icons.len() as u32;
         self.batches.push(Batch {
             origin,
             buffer,
-            kind: BatchKind::Icon {
-                count: icons.len() as u32,
-            },
+            kind: BatchKind::Icon { count: icon_count },
             slot,
+            vertices: icon_count * 6,
+            triangles: icon_count * 2,
         });
         Some(self.batches.len() - 1)
     }
 
     pub fn update_origins(&self, gpu: &Gpu, eye: DVec3) {
-        for batch in self.batches.iter() {
+        for batch in self.batches.iter().chain(self.debug.iter()) {
             let rel = (batch.origin - eye).as_vec3();
             let data = [rel.x, rel.y, rel.z, 0.0f32];
             gpu.queue.write_buffer(
@@ -614,23 +892,26 @@ impl VectorRenderer {
     }
 
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        if self.batches.is_empty() {
+        if self.batches.is_empty() && self.debug.is_none() {
             return;
         }
         pass.set_bind_group(0, &self.globals_bg, &[]);
 
         pass.set_pipeline(&self.poly_pipeline);
         for batch in self.batches.iter() {
-            if let BatchKind::Polygon { indices, count } = &batch.kind {
-                pass.set_bind_group(1, &self.batch_bg, &[batch.slot * BATCH_STRIDE as u32]);
-                pass.set_vertex_buffer(0, batch.buffer.slice(..));
-                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..*count, 0, 0..1);
-            }
+            let (BatchKind::Polygon { indices, count } | BatchKind::Tube { indices, count }) =
+                &batch.kind
+            else {
+                continue;
+            };
+            pass.set_bind_group(1, &self.batch_bg, &[batch.slot * BATCH_STRIDE as u32]);
+            pass.set_vertex_buffer(0, batch.buffer.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..*count, 0, 0..1);
         }
 
         pass.set_pipeline(&self.line_pipeline);
-        for batch in self.batches.iter() {
+        for batch in self.batches.iter().chain(self.debug.iter()) {
             if let BatchKind::Line { count } = &batch.kind {
                 pass.set_bind_group(1, &self.batch_bg, &[batch.slot * BATCH_STRIDE as u32]);
                 pass.set_vertex_buffer(0, batch.buffer.slice(..));

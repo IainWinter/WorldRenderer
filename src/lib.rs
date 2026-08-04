@@ -13,6 +13,7 @@ mod worker;
 
 use camera::Camera;
 use gpu::{Gpu, UploadBudget};
+use math::ray_far_distance;
 use model_gpu::ModelRenderer;
 use quadtree::TileTree;
 use std::cell::RefCell;
@@ -26,6 +27,8 @@ use web_sys::HtmlCanvasElement;
 
 pub const UPLOAD_BYTES_PER_FRAME: usize = 3 * 1024 * 1024;
 pub const MIN_GROUND_CLEARANCE: f64 = 12.0;
+pub const CANCEL_COOLDOWN_MS: f64 = 250.0;
+pub const MAX_DPI: f64 = 1.5;
 
 #[derive(Default)]
 struct Input {
@@ -53,10 +56,14 @@ struct App {
     vectors: VectorRenderer,
     models: ModelRenderer,
     model_urls: Vec<String>,
+    icon_sheet: Option<(String, u32, u32)>,
     flights: Vec<Flight>,
     tree: TileTree,
     pool: WorkerPool,
     camera: Camera,
+    frozen: Option<Camera>,
+    show_frustum: bool,
+    show_bounds: bool,
     budget: UploadBudget,
     deferred: Vec<Incoming>,
     canvas: HtmlCanvasElement,
@@ -64,6 +71,7 @@ struct App {
     resolution_scale: f64,
     frames: u32,
     last_frame_time: f64,
+    last_cancel_time: f64,
     last_fps_time: f64,
     frame_ms: f64,
     frame_ms_avg: f64,
@@ -84,6 +92,10 @@ fn now() -> f64 {
     window().performance().map(|p| p.now()).unwrap_or(0.0)
 }
 
+fn device_pixel_ratio() -> f64 {
+    window().device_pixel_ratio().clamp(1.0, MAX_DPI)
+}
+
 fn with_app<T>(f: impl FnOnce(&mut App) -> T, fallback: T) -> T {
     APP.with(|slot| match slot.borrow_mut().as_mut() {
         Some(app) => f(app),
@@ -102,7 +114,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
         .ok_or("canvas not found")?
         .dyn_into()?;
 
-    let dpr = window().device_pixel_ratio().clamp(1.0, 1.5);
+    let dpr = device_pixel_ratio();
     let width = (canvas.client_width().max(1) as f64 * dpr) as u32;
     let height = (canvas.client_height().max(1) as f64 * dpr) as u32;
     canvas.set_width(width);
@@ -123,10 +135,14 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
         vectors,
         models,
         model_urls: Vec::new(),
+        icon_sheet: None,
         flights: Vec::new(),
         tree: TileTree::new(),
         pool,
         camera: Camera::new(),
+        frozen: None,
+        show_frustum: true,
+        show_bounds: false,
         budget: UploadBudget::new(UPLOAD_BYTES_PER_FRAME),
         deferred: Vec::new(),
         canvas: canvas.clone(),
@@ -134,6 +150,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
         resolution_scale: 1.0,
         frames: 0,
         last_frame_time: now(),
+        last_cancel_time: 0.0,
         last_fps_time: now(),
         frame_ms: 0.0,
         frame_ms_avg: 0.0,
@@ -327,7 +344,7 @@ fn start_loop() {
 
 impl App {
     fn sync_size(&mut self) {
-        let dpr = window().device_pixel_ratio().clamp(1.0, 1.5) * self.resolution_scale;
+        let dpr = device_pixel_ratio() * self.resolution_scale;
         let w = (self.canvas.client_width().max(1) as f64 * dpr) as u32;
         let h = (self.canvas.client_height().max(1) as f64 * dpr) as u32;
         if w != self.gpu.config.width || h != self.gpu.config.height {
@@ -376,11 +393,27 @@ impl App {
             &mut self.deferred,
         );
 
-        self.integrate_models();
-        self.tree
-            .select(&self.camera, self.gpu.config.height as f32, &mut self.pool);
+        if !self.tree.frozen {
+            self.integrate_models();
+        }
+        let cull = self.frozen.as_ref().unwrap_or(&self.camera);
+        self.tree.select(
+            cull,
+            self.camera.eye,
+            self.gpu.config.height as f32,
+            &mut self.pool,
+        );
+        if self.show_bounds {
+            refresh_debug_lines(self);
+        }
         self.advance_flights(dt);
-        self.pool.dispatch();
+        if !self.tree.frozen {
+            if self.tree.camera_jumped && started - self.last_cancel_time > CANCEL_COOLDOWN_MS {
+                self.pool.cancel_stale();
+                self.last_cancel_time = started;
+            }
+            self.pool.dispatch();
+        }
 
         let sun = self.camera.eye.normalize().as_vec3();
         self.terrain.write_globals(
@@ -501,6 +534,52 @@ impl App {
             };
             self.models.upload(&self.gpu, slot, &data);
         }
+
+        if let Some((url, _, _)) = self.icon_sheet.clone() {
+            if !self.vectors.icon_sheet_loaded {
+                self.pool.request(
+                    stream::JobKind::Icon,
+                    tiling::TileKey { z: 254, x: 0, y: 0 },
+                    url,
+                    [1.0, 0.0, 0.0],
+                    -10_000.0,
+                );
+            }
+        }
+        let incoming = std::mem::take(&mut self.tree.icons);
+        for msg in incoming {
+            let Some((_, cols, rows)) = self.icon_sheet else {
+                continue;
+            };
+            let Some(payload) = msg.payload.as_ref() else {
+                continue;
+            };
+            let bytes = payload.to_vec();
+            if bytes.len() < 8 {
+                continue;
+            }
+            let w = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let h = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            self.vectors
+                .set_icon_sheet(&self.gpu, w, h, &bytes[8..], cols, rows);
+        }
+    }
+
+    fn stress_site(&self, i: u32, count: u32) -> (f64, f64, f64, f64) {
+        let (lon0, lat0) = self.camera.lon_lat();
+        let lon0 = lon0.to_degrees();
+        let lat0 = lat0.to_degrees();
+        let span = (self.camera.distance / 111_320.0).clamp(0.004, 40.0);
+        let cols = (count as f64).sqrt().ceil().max(1.0);
+        let col = (i as f64) % cols;
+        let row = (i as f64 / cols).floor();
+        let u = (col + 0.5) / cols - 0.5;
+        let v = (row + 0.5) / cols - 0.5;
+        let lat = (lat0 + v * span).clamp(-84.0, 84.0);
+        let lon = lon0 + u * span / lat0.to_radians().cos().abs().max(0.15);
+        let cell = span / cols;
+        let ground = self.tree.ground_height(lon.to_radians(), lat.to_radians());
+        (lon, lat, cell, ground)
     }
 
     fn advance_flights(&mut self, dt: f64) {
@@ -558,6 +637,21 @@ impl App {
             }
         }
     }
+}
+
+fn rand01(seed: u32) -> f64 {
+    let mut x = seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+    x = (x >> ((x >> 28).wrapping_add(4))) ^ x;
+    x = x.wrapping_mul(277_803_737);
+    x ^= x >> 22;
+    (x >> 8) as f64 / 16_777_216.0
+}
+
+fn stress_color(seed: u32, alpha: u32) -> u32 {
+    let r = (80.0 + rand01(seed) * 175.0) as u32;
+    let g = (80.0 + rand01(seed ^ 0x9e37) * 175.0) as u32;
+    let b = (80.0 + rand01(seed ^ 0x85eb) * 175.0) as u32;
+    (r << 24) | (g << 16) | (b << 8) | alpha
 }
 
 #[wasm_bindgen]
@@ -657,15 +751,7 @@ pub fn debug_json() -> String {
                 .iter()
                 .map(|(ready, flight)| format!("{{\"ready\":{},\"inFlight\":{}}}", ready, flight))
                 .collect();
-            let batches = app
-                .vectors
-                .batches
-                .iter()
-                .fold((0, 0, 0), |acc, b| match b.kind {
-                    vector::BatchKind::Polygon { .. } => (acc.0 + 1, acc.1, acc.2),
-                    vector::BatchKind::Line { .. } => (acc.0, acc.1 + 1, acc.2),
-                    vector::BatchKind::Icon { .. } => (acc.0, acc.1, acc.2 + 1),
-                });
+            let batches = app.vectors.totals();
             let model_instances: usize = app.models.models.iter().map(|m| m.live.len()).sum();
             let models_ready = (0..app.model_urls.len())
                 .filter(|s| app.models.ready(*s))
@@ -674,7 +760,8 @@ pub fn debug_json() -> String {
                 concat!(
                     "{{",
                     "\"frame\":{{\"fps\":{:.1},\"ms\":{:.2},\"msAvg\":{:.2},\"uncappedFps\":{:.0},",
-                    "\"uncapped\":{},\"width\":{},\"height\":{},\"scale\":{:.2}}},",
+                    "\"uncapped\":{},\"width\":{},\"height\":{},\"scale\":{:.2},",
+                    "\"dpr\":{:.2}}},",
                     "\"camera\":{{\"lon\":{:.5},\"lat\":{:.5},\"alt\":{:.1},\"distance\":{:.1},",
                     "\"heading\":{:.1},\"tilt\":{:.1},\"clearance\":{:.1}}},",
                     "\"draw\":{{\"drawn\":{},\"instances\":{},\"minLevel\":{},\"maxLevel\":{},",
@@ -688,9 +775,11 @@ pub fn debug_json() -> String {
                     "\"stalls\":{},\"dropped\":{},\"meshEvictions\":{},\"imageryEvictions\":{},",
                     "\"retiredMeshes\":{},\"retiredImagery\":{},\"cameraJumped\":{}}},",
                     "\"pool\":{{\"active\":{},\"terrain\":{},\"imagery\":{},\"model\":{},",
-                    "\"queueDepth\":{},\"sent\":{},\"dropped\":{},\"dispatched\":{},\"inbox\":{},\"maxInFlight\":{}}},",
-                    "\"scene\":{{\"polygons\":{},\"lines\":{},\"icons\":{},\"models\":{},",
-                    "\"modelsReady\":{},\"modelInstances\":{},\"flights\":{}}},",
+                    "\"queueDepth\":{},\"sent\":{},\"dropped\":{},\"dispatched\":{},\"inbox\":{},",
+                    "\"cancelled\":{},\"maxInFlight\":{}}},",
+                    "\"scene\":{{\"polygons\":{},\"tubes\":{},\"lines\":{},\"icons\":{},",
+                    "\"vectorVerts\":{},\"vectorTris\":{},\"vectorBatches\":{},\"iconSheet\":{},",
+                    "\"models\":{},\"modelsReady\":{},\"modelInstances\":{},\"flights\":{}}},",
                     "\"levels\":[{}],\"workers\":[{}]}}"
                 ),
                 app.fps,
@@ -705,6 +794,7 @@ pub fn debug_json() -> String {
                 app.gpu.config.width,
                 app.gpu.config.height,
                 app.resolution_scale,
+                device_pixel_ratio(),
                 lon.to_degrees(),
                 lat.to_degrees(),
                 app.camera.altitude(),
@@ -757,10 +847,16 @@ pub fn debug_json() -> String {
                 app.pool.dropped,
                 app.pool.dispatched,
                 app.pool.inbox_len(),
+                app.pool.cancelled,
                 app.pool.max_in_flight(),
                 batches.0,
                 batches.1,
                 batches.2,
+                batches.3,
+                batches.4,
+                batches.5,
+                app.vectors.batches.len(),
+                app.vectors.icon_sheet_loaded,
                 app.models.models.len(),
                 models_ready,
                 model_instances,
@@ -805,6 +901,124 @@ pub fn pick(ndc_x: f64, ndc_y: f64) -> Vec<f64> {
             None => Vec::new(),
         },
         Vec::new(),
+    )
+}
+
+fn frustum_segments(cam: &Camera) -> Vec<(glam::DVec3, glam::DVec3)> {
+    const STEPS: usize = 8;
+    let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+    let mut border = Vec::with_capacity(4 * STEPS);
+    for i in 0..4 {
+        let (x0, y0) = corners[i];
+        let (x1, y1) = corners[(i + 1) % 4];
+        for j in 0..STEPS {
+            let t = j as f64 / STEPS as f64;
+            let dir = cam.ray(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+            border.push(cam.eye + dir * ray_far_distance(cam.eye, dir));
+        }
+    }
+    let mut segments = Vec::with_capacity(border.len() + 4);
+    for i in 0..border.len() {
+        segments.push((border[i], border[(i + 1) % border.len()]));
+    }
+    for i in 0..4 {
+        segments.push((cam.eye, border[i * STEPS]));
+    }
+    segments
+}
+
+fn refresh_debug_lines(app: &mut App) {
+    let mut segments = Vec::new();
+    if let Some(cam) = app.frozen.as_ref().filter(|_| app.show_frustum) {
+        segments.extend(
+            frustum_segments(cam)
+                .into_iter()
+                .map(|(a, b)| (a, b, 0x6ea8ffff)),
+        );
+    }
+    if app.show_bounds {
+        segments.extend(app.tree.bound_segments());
+    }
+    if segments.is_empty() {
+        app.vectors.clear_debug_lines();
+        return;
+    }
+    let origin = app.camera.eye;
+    app.vectors
+        .set_debug_lines(&app.gpu, origin, &segments, 2.0);
+}
+
+#[wasm_bindgen]
+pub fn set_debug_freeze_camera(frozen: bool) {
+    with_app(
+        |app| {
+            match (frozen, app.frozen.is_some()) {
+                (true, false) => app.frozen = Some(app.camera.clone()),
+                (false, true) => app.frozen = None,
+                _ => return,
+            }
+            refresh_debug_lines(app);
+        },
+        (),
+    );
+}
+
+#[wasm_bindgen]
+pub fn set_debug_freeze_work(frozen: bool) {
+    with_app(|app| app.tree.frozen = frozen, ());
+}
+
+#[wasm_bindgen]
+pub fn set_debug_frustum(show: bool) {
+    with_app(
+        |app| {
+            app.show_frustum = show;
+            refresh_debug_lines(app);
+        },
+        (),
+    );
+}
+
+#[wasm_bindgen]
+pub fn set_debug_bounds(show: bool) {
+    with_app(
+        |app| {
+            app.show_bounds = show;
+            refresh_debug_lines(app);
+        },
+        (),
+    );
+}
+
+#[wasm_bindgen]
+pub fn set_tile_debug(mode: u32) {
+    with_app(|app| app.tree.debug_mode = mode.min(4), ());
+}
+
+#[wasm_bindgen]
+pub fn debug_view_json() -> String {
+    with_app(
+        |app| {
+            let cam = app.frozen.as_ref();
+            let (lon, lat) = cam.map(|c| c.lon_lat()).unwrap_or((0.0, 0.0));
+            format!(
+                concat!(
+                    "{{\"frozen\":{},\"frozenWork\":{},\"mode\":{},\"frustum\":{},\"bounds\":{},",
+                    "\"frozenLon\":{:.4},",
+                    "\"frozenLat\":{:.4},\"frozenAlt\":{:.0},\"frozenDistance\":{:.0}}}"
+                ),
+                app.frozen.is_some(),
+                app.tree.frozen,
+                app.tree.debug_mode,
+                app.show_frustum,
+                app.show_bounds,
+                lon.to_degrees(),
+                lat.to_degrees(),
+                cam.map(|c| c.altitude()).unwrap_or(0.0),
+                cam.map(|c| c.distance).unwrap_or(0.0),
+            )
+        },
+        "{}".to_string(),
     )
 }
 
@@ -895,11 +1109,11 @@ pub fn add_line(coords: Vec<f64>, width_px: f32, color: u32) -> i32 {
 }
 
 #[wasm_bindgen]
-pub fn add_icons(coords: Vec<f64>, size_px: f32, color: u32) -> i32 {
+pub fn add_tube(coords: Vec<f64>, radius_m: f64, sides: u32, color: u32) -> i32 {
     with_app(
         |app| {
             app.vectors
-                .add_icons(&app.gpu, &coords, size_px, color)
+                .add_tube(&app.gpu, &coords, radius_m, sides, color)
                 .map(|i| i as i32)
                 .unwrap_or(-1)
         },
@@ -908,8 +1122,190 @@ pub fn add_icons(coords: Vec<f64>, size_px: f32, color: u32) -> i32 {
 }
 
 #[wasm_bindgen]
+pub fn add_icons(coords: Vec<f64>, size_px: f32, color: u32, icon: u32) -> i32 {
+    with_app(
+        |app| {
+            app.vectors
+                .add_icons(&app.gpu, &coords, size_px, color, icon)
+                .map(|i| i as i32)
+                .unwrap_or(-1)
+        },
+        -1,
+    )
+}
+
+#[wasm_bindgen]
+pub fn load_icons(url: String, cols: u32, rows: u32) {
+    with_app(
+        |app| app.icon_sheet = Some((url, cols.max(1), rows.max(1))),
+        (),
+    );
+}
+
+#[wasm_bindgen]
+pub fn icons_ready() -> bool {
+    with_app(|app| app.vectors.icon_sheet_loaded, false)
+}
+
+#[wasm_bindgen]
 pub fn vector_batches() -> usize {
     with_app(|app| app.vectors.batches.len(), 0)
+}
+
+#[wasm_bindgen]
+pub fn stress_polygons(count: u32) -> usize {
+    with_app(
+        |app| {
+            for i in 0..count {
+                let (lon, lat, cell, ground) = app.stress_site(i, count);
+                let r = cell * (0.12 + 0.14 * rand01(i));
+                let sides = 4 + (rand01(i ^ 0x51) * 5.0) as u32;
+                let mut ring = Vec::with_capacity(sides as usize * 2);
+                let lat_scale = lat.to_radians().cos().abs().max(0.15);
+                for s in 0..sides {
+                    let a = std::f64::consts::TAU * s as f64 / sides as f64;
+                    ring.push(lon + r * a.cos() / lat_scale);
+                    ring.push(lat + r * a.sin());
+                }
+                let height = 150.0 + rand01(i ^ 0x77) * 1200.0;
+                app.vectors.add_polygon(
+                    &app.gpu,
+                    &ring,
+                    ground,
+                    ground + height,
+                    stress_color(i, 0xcc),
+                );
+            }
+            app.vectors.batches.len()
+        },
+        0,
+    )
+}
+
+#[wasm_bindgen]
+pub fn stress_lines(count: u32) -> usize {
+    with_app(
+        |app| {
+            for i in 0..count {
+                let (lon, lat, cell, ground) = app.stress_site(i, count);
+                let lat_scale = lat.to_radians().cos().abs().max(0.15);
+                let points = 24;
+                let mut path = Vec::with_capacity(points * 3);
+                for p in 0..points {
+                    let t = p as f64 / (points - 1) as f64;
+                    let wobble = (t * std::f64::consts::TAU * 2.0).sin() * cell * 0.2;
+                    path.push(lon + (t - 0.5) * cell * 0.7 / lat_scale);
+                    path.push(lat + wobble);
+                    path.push(ground + 200.0 + rand01(i * 31 + p as u32) * 900.0);
+                }
+                app.vectors.add_line(
+                    &app.gpu,
+                    &path,
+                    (1.0 + rand01(i ^ 0x1234) * 4.0) as f32,
+                    stress_color(i ^ 0xabcd, 0xff),
+                );
+            }
+            app.vectors.batches.len()
+        },
+        0,
+    )
+}
+
+#[wasm_bindgen]
+pub fn stress_tubes(count: u32) -> usize {
+    with_app(
+        |app| {
+            for i in 0..count {
+                let (lon, lat, cell, ground) = app.stress_site(i, count);
+                let lat_scale = lat.to_radians().cos().abs().max(0.15);
+                let points = 12;
+                let mut path = Vec::with_capacity(points * 3);
+                let turns = 1.0 + rand01(i ^ 0x9) * 2.0;
+                for p in 0..points {
+                    let t = p as f64 / (points - 1) as f64;
+                    let a = t * std::f64::consts::TAU * turns;
+                    path.push(lon + a.cos() * cell * 0.22 / lat_scale);
+                    path.push(lat + a.sin() * cell * 0.22);
+                    path.push(ground + 120.0 + t * (400.0 + rand01(i) * 900.0));
+                }
+                let radius = cell * 111_320.0 * 0.015;
+                app.vectors.add_tube(
+                    &app.gpu,
+                    &path,
+                    radius.max(4.0),
+                    10,
+                    stress_color(i ^ 0x5eed, 0xff),
+                );
+            }
+            app.vectors.batches.len()
+        },
+        0,
+    )
+}
+
+#[wasm_bindgen]
+pub fn stress_icons(count: u32, per_batch: u32) -> usize {
+    with_app(
+        |app| {
+            let per_batch = per_batch.max(1);
+            for i in 0..count {
+                let (lon, lat, cell, ground) = app.stress_site(i, count);
+                let lat_scale = lat.to_radians().cos().abs().max(0.15);
+                let mut pts = Vec::with_capacity(per_batch as usize * 3);
+                for p in 0..per_batch {
+                    let seed = i * 977 + p;
+                    pts.push(lon + (rand01(seed) - 0.5) * cell * 0.8 / lat_scale);
+                    pts.push(lat + (rand01(seed ^ 0x3333) - 0.5) * cell * 0.8);
+                    pts.push(ground + 300.0 + rand01(seed ^ 0x4444) * 1500.0);
+                }
+                let icon = i % (app.vectors.icon_cols * app.vectors.icon_rows).max(1);
+                app.vectors.add_icons(
+                    &app.gpu,
+                    &pts,
+                    (14.0 + rand01(i) * 22.0) as f32,
+                    stress_color(i ^ 0x2f2f, 0xff),
+                    icon,
+                );
+            }
+            app.vectors.batches.len()
+        },
+        0,
+    )
+}
+
+#[wasm_bindgen]
+pub fn stress_models(model: usize, count: u32, scale: f32) -> usize {
+    with_app(
+        |app| {
+            if app.models.models.len() <= model {
+                return 0;
+            }
+            for i in 0..count {
+                let (lon, lat, cell, ground) = app.stress_site(i, count);
+                let lat_scale = lat.to_radians().cos().abs().max(0.15);
+                let alt = ground + 400.0 + rand01(i ^ 0x66) * 2500.0;
+                let legs = 3 + (rand01(i ^ 0x88) * 3.0) as u32;
+                let mut waypoints = Vec::with_capacity(legs as usize * 3);
+                for p in 0..legs {
+                    let a = std::f64::consts::TAU * p as f64 / legs as f64;
+                    waypoints.push(lon + a.cos() * cell * 0.35 / lat_scale);
+                    waypoints.push(lat + a.sin() * cell * 0.35);
+                    waypoints.push(alt);
+                }
+                let speed = 40.0 + rand01(i ^ 0x99) * 220.0;
+                add_flight_inner(
+                    app,
+                    model,
+                    waypoints,
+                    speed,
+                    scale,
+                    stress_color(i ^ 0x7a7a, 0xff),
+                );
+            }
+            app.flights.len()
+        },
+        0,
+    )
 }
 
 #[wasm_bindgen]
@@ -943,6 +1339,52 @@ pub fn model_instances(slot: usize) -> usize {
     )
 }
 
+fn add_flight_inner(
+    app: &mut App,
+    model: usize,
+    waypoints: Vec<f64>,
+    speed_mps: f64,
+    scale: f32,
+    color: u32,
+) -> i32 {
+    if waypoints.len() < 6 || app.models.models.len() <= model {
+        return -1;
+    }
+    if app.models.models[model].live.len() as u64 >= model_gpu::MAX_INSTANCES {
+        return -1;
+    }
+    let points: Vec<(f64, f64, f64)> = waypoints
+        .chunks_exact(3)
+        .map(|c| (c[0], c[1], c[2]))
+        .collect();
+    let instance = {
+        let entry = &mut app.models.models[model];
+        entry.live.push(model_gpu::ModelInstance {
+            row0: [1.0, 0.0, 0.0, 0.0],
+            row1: [0.0, 1.0, 0.0, 0.0],
+            row2: [0.0, 0.0, 1.0, 0.0],
+            color: [0.0, 0.0, 0.0, 0.0],
+        });
+        entry.live.len() - 1
+    };
+    app.flights.push(Flight {
+        model,
+        instance,
+        waypoints: points,
+        speed: speed_mps,
+        progress: 0.0,
+        leg: 0,
+        scale,
+        color: [
+            ((color >> 24) & 0xff) as f32 / 255.0,
+            ((color >> 16) & 0xff) as f32 / 255.0,
+            ((color >> 8) & 0xff) as f32 / 255.0,
+            (color & 0xff) as f32 / 255.0,
+        ],
+    });
+    (app.flights.len() - 1) as i32
+}
+
 #[wasm_bindgen]
 pub fn add_flight(
     model: usize,
@@ -952,41 +1394,7 @@ pub fn add_flight(
     color: u32,
 ) -> i32 {
     with_app(
-        |app| {
-            if waypoints.len() < 6 || app.models.models.len() <= model {
-                return -1;
-            }
-            let points: Vec<(f64, f64, f64)> = waypoints
-                .chunks_exact(3)
-                .map(|c| (c[0], c[1], c[2]))
-                .collect();
-            let instance = {
-                let entry = &mut app.models.models[model];
-                entry.live.push(model_gpu::ModelInstance {
-                    row0: [1.0, 0.0, 0.0, 0.0],
-                    row1: [0.0, 1.0, 0.0, 0.0],
-                    row2: [0.0, 0.0, 1.0, 0.0],
-                    color: [0.0, 0.0, 0.0, 0.0],
-                });
-                entry.live.len() - 1
-            };
-            app.flights.push(Flight {
-                model,
-                instance,
-                waypoints: points,
-                speed: speed_mps,
-                progress: 0.0,
-                leg: 0,
-                scale,
-                color: [
-                    ((color >> 24) & 0xff) as f32 / 255.0,
-                    ((color >> 16) & 0xff) as f32 / 255.0,
-                    ((color >> 8) & 0xff) as f32 / 255.0,
-                    (color & 0xff) as f32 / 255.0,
-                ],
-            });
-            (app.flights.len() - 1) as i32
-        },
+        |app| add_flight_inner(app, model, waypoints, speed_mps, scale, color),
         -1,
     )
 }

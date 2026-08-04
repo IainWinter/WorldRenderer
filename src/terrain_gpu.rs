@@ -19,13 +19,15 @@ pub struct Globals {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TileInstance {
     pub origin: [f32; 3],
-    pub morph: f32,
+    pub morph_lo: f32,
     pub uvxf: [f32; 4],
     pub prev_uvxf: [f32; 4],
     pub layers: [f32; 2],
-    pub fade: f32,
-    pub pad: f32,
+    pub blend: [f32; 4],
+    pub dbg: [f32; 4],
 }
+
+pub const INSTANCE_SIZE: u64 = std::mem::size_of::<TileInstance>() as u64;
 
 pub struct TerrainRenderer {
     pub pipeline: wgpu::RenderPipeline,
@@ -206,7 +208,7 @@ impl TerrainRenderer {
                         ],
                     }),
                     Some(wgpu::VertexBufferLayout {
-                        array_stride: 64,
+                        array_stride: INSTANCE_SIZE,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &[
                             wgpu::VertexAttribute {
@@ -235,9 +237,14 @@ impl TerrainRenderer {
                                 shader_location: 8,
                             },
                             wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32,
+                                format: wgpu::VertexFormat::Float32x4,
                                 offset: 56,
                                 shader_location: 9,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 72,
+                                shader_location: 10,
                             },
                         ],
                     }),
@@ -338,9 +345,9 @@ impl TerrainRenderer {
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
         for (i, slot) in slots.iter().enumerate() {
             let vb = (*slot as u64) * (SLOT_SIZE as u64);
-            let ib = (i as u64) * 64;
+            let ib = (i as u64) * INSTANCE_SIZE;
             pass.set_vertex_buffer(0, self.arena.slice(vb..vb + SLOT_SIZE as u64));
-            pass.set_vertex_buffer(1, self.instances.slice(ib..ib + 64));
+            pass.set_vertex_buffer(1, self.instances.slice(ib..ib + INSTANCE_SIZE));
             pass.draw_indexed(0..TOTAL_INDICES, 0, 0..1);
         }
     }

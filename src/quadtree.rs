@@ -15,6 +15,7 @@ pub const SPLIT_HYSTERESIS: f64 = 0.75;
 pub const MAX_RETRIES: u8 = 3;
 pub const RETRY_DELAY_FRAMES: u64 = 120;
 pub const IMAGERY_FADE_FRAMES: f64 = 15.0;
+pub const GEOMORPH_FRAMES: f64 = 18.0;
 pub const EVICT_PROTECT_FRAMES: u64 = 30;
 pub const MAX_DEFERRED: usize = 512;
 pub const MAX_LEVELS: usize = 24;
@@ -25,6 +26,22 @@ pub const RETIRE_JUMP_FRAMES: u64 = 15;
 pub const RETIRE_PRESSURE_FRAMES: u64 = 60;
 pub const ARENA_TRIM_HIGH: f32 = 0.85;
 pub const CAMERA_JUMP_FRACTION: f64 = 0.5;
+pub const DEBUG_TINT: f32 = 0.6;
+
+const LEVEL_COLORS: [[f32; 3]; 12] = [
+    [0.25, 0.35, 1.0],
+    [0.2, 0.7, 1.0],
+    [0.2, 1.0, 0.85],
+    [0.3, 1.0, 0.35],
+    [0.75, 1.0, 0.2],
+    [1.0, 0.9, 0.2],
+    [1.0, 0.65, 0.15],
+    [1.0, 0.4, 0.2],
+    [1.0, 0.25, 0.45],
+    [1.0, 0.3, 0.8],
+    [0.75, 0.4, 1.0],
+    [0.55, 0.55, 0.65],
+];
 
 struct TileShading {
     layer: f32,
@@ -49,6 +66,7 @@ impl Default for TileShading {
 struct MeshRes {
     slot: u32,
     center: DVec3,
+    min_height: f32,
     max_height: f32,
 }
 
@@ -65,7 +83,16 @@ struct Tile {
     imagery_retry_at: u64,
     last_used: u64,
     last_drawn: u64,
+    unfold_at: u64,
+    merge_at: u64,
     split: bool,
+}
+
+fn ramp(at: u64, frame: u64) -> f32 {
+    if at == 0 {
+        return 1.0;
+    }
+    (frame.saturating_sub(at) as f64 / GEOMORPH_FRAMES).clamp(0.0, 1.0) as f32
 }
 
 #[derive(Default)]
@@ -96,6 +123,7 @@ pub struct TileTree {
     tiles: HashMap<TileKey, Tile>,
     frame: u64,
     pub drawn: Vec<u32>,
+    pub drawn_keys: Vec<TileKey>,
     pub instances: Vec<TileInstance>,
     pub max_level_drawn: u8,
     pub min_level_drawn: u8,
@@ -115,8 +143,13 @@ pub struct TileTree {
     pub retired_meshes: u64,
     pub retired_imagery: u64,
     pub camera_jumped: bool,
+    pub last_frustum: Option<Frustum>,
+    pub last_cull_eye: DVec3,
+    pub frozen: bool,
+    pub debug_mode: u32,
     last_anchor: DVec3,
     pub models: Vec<crate::stream::Incoming>,
+    pub icons: Vec<crate::stream::Incoming>,
 }
 
 impl TileTree {
@@ -125,6 +158,7 @@ impl TileTree {
             tiles: HashMap::new(),
             frame: 0,
             drawn: Vec::new(),
+            drawn_keys: Vec::new(),
             instances: Vec::new(),
             max_level_drawn: 0,
             min_level_drawn: 0,
@@ -144,8 +178,13 @@ impl TileTree {
             retired_meshes: 0,
             retired_imagery: 0,
             camera_jumped: false,
+            last_frustum: None,
+            last_cull_eye: DVec3::ZERO,
+            frozen: false,
+            debug_mode: 0,
             last_anchor: DVec3::ZERO,
             models: Vec::new(),
+            icons: Vec::new(),
         }
     }
 
@@ -242,6 +281,7 @@ impl TileTree {
         }
         self.tiles.clear();
         self.drawn.clear();
+        self.drawn_keys.clear();
         self.instances.clear();
     }
 
@@ -256,9 +296,12 @@ impl TileTree {
         }
     }
 
-    pub fn select(&mut self, camera: &Camera, screen_h: f32, pool: &mut WorkerPool) {
-        self.frame += 1;
+    pub fn select(&mut self, camera: &Camera, eye: DVec3, screen_h: f32, pool: &mut WorkerPool) {
+        if !self.frozen {
+            self.frame += 1;
+        }
         self.drawn.clear();
+        self.drawn_keys.clear();
         self.instances.clear();
         self.max_level_drawn = 0;
         self.min_level_drawn = u8::MAX;
@@ -274,9 +317,13 @@ impl TileTree {
             self.last_anchor != DVec3::ZERO && moved > camera.distance * CAMERA_JUMP_FRACTION;
         self.last_anchor = anchor_now;
 
-        let frustum = Frustum::from_view_proj(camera.view_proj);
+        let frustum = Frustum::from_camera(camera);
+        self.last_frustum = Some(Frustum::from_camera(camera));
+        self.last_cull_eye = camera.eye;
         let k = screen_h as f64 / (2.0 * (camera.fov_y as f64 * 0.5).tan());
-        self.prefetch_focus(camera, k, pool);
+        if !self.frozen {
+            self.prefetch_focus(camera, k, pool);
+        }
         let roots = 1u32 << ROOT_LEVEL;
         for y in 0..roots {
             for x in 0..roots {
@@ -287,6 +334,7 @@ impl TileTree {
                         y,
                     },
                     camera,
+                    eye,
                     &frustum,
                     k,
                     pool,
@@ -328,15 +376,18 @@ impl TileTree {
         }
     }
 
-    fn height_pad(&self, key: TileKey) -> f64 {
+    fn height_range(&self, key: TileKey) -> (f64, f64) {
         let mut levels = 0;
         loop {
             let anc = key.ancestor(levels);
             if let Some(mesh) = self.tiles.get(&anc).and_then(|t| t.mesh.as_ref()) {
-                return (mesh.max_height as f64).max(0.0) + HEIGHT_PAD_SLACK;
+                return (
+                    mesh.min_height as f64 - HEIGHT_PAD_SLACK,
+                    mesh.max_height as f64 + HEIGHT_PAD_SLACK,
+                );
             }
             if anc.z == 0 {
-                return MAX_TILE_HEIGHT;
+                return (-HEIGHT_PAD_SLACK, MAX_TILE_HEIGHT);
             }
             levels += 1;
         }
@@ -344,14 +395,83 @@ impl TileTree {
 
     fn visible(&self, key: TileKey, camera: &Camera, frustum: &Frustum) -> Option<f64> {
         let (center, radius) = key.bounding_sphere();
-        if !horizon_visible(camera.eye, center, radius + MAX_TILE_HEIGHT) {
+        let (h_min, h_max) = self.height_range(key);
+        if !horizon_visible(camera.eye, center, radius + h_max.max(0.0)) {
             return None;
         }
-        let rel = (center - camera.eye).as_vec3();
-        if !frustum.sphere_visible(rel, (radius + self.height_pad(key)) as f32) {
+        let (bc, baxes, bhalf) = key.bounding_box(h_min, h_max);
+        let rel = (bc - camera.eye).as_vec3();
+        let axes = [baxes[0].as_vec3(), baxes[1].as_vec3(), baxes[2].as_vec3()];
+        let half = [bhalf[0] as f32, bhalf[1] as f32, bhalf[2] as f32];
+        if !frustum.box_visible(rel, axes, half) {
             return None;
         }
         Some(((center - camera.eye).length() - radius).max(1.0))
+    }
+
+    pub fn surface_in_frustum(&self, key: TileKey) -> bool {
+        let Some(frustum) = self.last_frustum.as_ref() else {
+            return true;
+        };
+        let (lon0, lat0, lon1, lat1) = key.lon_lat_bounds();
+        let (h_min, h_max) = self.height_range(key);
+        let n = 6;
+        for i in 0..=n {
+            let lat = lat0 + (lat1 - lat0) * i as f64 / n as f64;
+            for j in 0..=n {
+                let lon = lon0 + (lon1 - lon0) * j as f64 / n as f64;
+                for h in [h_min, h_max] {
+                    let p = crate::math::geodetic_to_ecef(lon, lat, h);
+                    if frustum.contains_point((p - self.last_cull_eye).as_vec3()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn bound_segments(&self) -> Vec<(DVec3, DVec3, u32)> {
+        const EDGES: [(usize, usize); 12] = [
+            (0, 1),
+            (2, 3),
+            (4, 5),
+            (6, 7),
+            (0, 2),
+            (1, 3),
+            (4, 6),
+            (5, 7),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        ];
+        let mut out = Vec::with_capacity(self.drawn_keys.len() * EDGES.len());
+        for key in self.drawn_keys.iter() {
+            let (h_min, h_max) = self.height_range(*key);
+            let (c, axes, half) = key.bounding_box(h_min, h_max);
+            let rgb = LEVEL_COLORS[key.z as usize % LEVEL_COLORS.len()];
+            let color = if self.surface_in_frustum(*key) {
+                ((rgb[0] * 255.0) as u32) << 24
+                    | ((rgb[1] * 255.0) as u32) << 16
+                    | ((rgb[2] * 255.0) as u32) << 8
+                    | 0xff
+            } else {
+                0xff0000ff
+            };
+            let mut corners = [DVec3::ZERO; 8];
+            for (i, corner) in corners.iter_mut().enumerate() {
+                let sx = if i & 1 == 0 { -1.0 } else { 1.0 };
+                let sy = if i & 2 == 0 { -1.0 } else { 1.0 };
+                let sz = if i & 4 == 0 { -1.0 } else { 1.0 };
+                *corner =
+                    c + axes[0] * half[0] * sx + axes[1] * half[1] * sy + axes[2] * half[2] * sz;
+            }
+            for (a, b) in EDGES {
+                out.push((corners[a], corners[b], color));
+            }
+        }
+        out
     }
 
     fn renderable(&self, key: TileKey) -> bool {
@@ -368,6 +488,7 @@ impl TileTree {
         &mut self,
         key: TileKey,
         camera: &Camera,
+        eye: DVec3,
         frustum: &Frustum,
         k: f64,
         pool: &mut WorkerPool,
@@ -378,8 +499,10 @@ impl TileTree {
         };
         self.visited += 1;
 
-        let screen_px = key.ground_extent() / dist * k;
+        let extent = key.ground_extent();
+        let screen_px = extent / dist * k;
         let was_split = self.tiles.get(&key).is_some_and(|t| t.split);
+        let prev_drawn = self.tiles.get(&key).map(|t| t.last_drawn).unwrap_or(0);
         let threshold = if was_split {
             TILE_PIXEL_TARGET * SPLIT_HYSTERESIS
         } else {
@@ -406,8 +529,13 @@ impl TileTree {
                 parent.split = true;
                 parent.last_used = frame;
                 parent.last_drawn = frame;
+                if self.mesh_pressure < ARENA_TRIM_HIGH {
+                    for c in children {
+                        self.request_mesh(c, pool, dist as f32 * 2.0);
+                    }
+                }
                 for c in children {
-                    self.visit(c, camera, frustum, k, pool);
+                    self.visit(c, camera, eye, frustum, k, pool);
                 }
                 return;
             }
@@ -442,25 +570,95 @@ impl TileTree {
         let Some((slot, center)) = resident else {
             return;
         };
+        let mut morph_floor = 0.0f32;
+        let mut morph_ceil = 1.0f32;
         if let Some(tile) = self.tiles.get_mut(&key) {
             tile.last_drawn = frame;
+            if was_split {
+                tile.merge_at = frame;
+                tile.unfold_at = 0;
+            } else if prev_drawn + 1 < frame {
+                tile.unfold_at = frame;
+                tile.merge_at = 0;
+            }
+            morph_floor = 1.0 - ramp(tile.unfold_at, frame);
+            morph_ceil = ramp(tile.merge_at, frame).max(morph_floor);
         }
         self.request_imagery(key, pool, dist as f32);
-        let origin = (center - camera.eye).as_vec3();
+        let origin = (center - eye).as_vec3();
         let shade = self.resolve_imagery(key);
-        let morph = (2.0 * (1.0 - screen_px / TILE_PIXEL_TARGET)).clamp(0.0, 1.0) as f32;
+        let dbg = self.debug_color(key, slot);
+        let morph_lo = extent * k / TILE_PIXEL_TARGET;
         self.max_level_drawn = self.max_level_drawn.max(key.z);
         self.min_level_drawn = self.min_level_drawn.min(key.z);
         self.drawn.push(slot);
+        self.drawn_keys.push(key);
         self.instances.push(TileInstance {
             origin: origin.to_array(),
-            morph,
+            morph_lo: morph_lo as f32,
             uvxf: shade.uvxf,
             prev_uvxf: shade.prev_uvxf,
             layers: [shade.layer, shade.prev_layer],
-            fade: shade.fade,
-            pad: 0.0,
+            blend: [shade.fade, (morph_lo * 2.0) as f32, morph_floor, morph_ceil],
+            dbg,
         });
+    }
+
+    fn imagery_depth(&self, key: TileKey) -> i32 {
+        let mut levels = 0u8;
+        loop {
+            let anc = key.ancestor(levels);
+            if self.tiles.get(&anc).is_some_and(|t| t.imagery.is_some()) {
+                return levels as i32;
+            }
+            if anc.z == 0 {
+                return -1;
+            }
+            levels += 1;
+        }
+    }
+
+    fn debug_color(&self, key: TileKey, slot: u32) -> [f32; 4] {
+        if self.debug_mode == 0 {
+            return [0.0, 0.0, 0.0, 0.0];
+        }
+        let a = DEBUG_TINT;
+        let rgb = match self.debug_mode {
+            1 => LEVEL_COLORS[key.z as usize % LEVEL_COLORS.len()],
+            2 => {
+                let tile = self.tiles.get(&key);
+                let failed = tile
+                    .is_some_and(|t| t.mesh_fails >= MAX_RETRIES || t.imagery_fails >= MAX_RETRIES);
+                let inbound = tile.is_some_and(|t| t.mesh_inbound || t.imagery_inbound);
+                let own = tile.is_some_and(|t| t.imagery.is_some());
+                if failed {
+                    [1.0, 0.15, 0.15]
+                } else if inbound {
+                    [0.3, 0.55, 1.0]
+                } else if own {
+                    [0.25, 1.0, 0.4]
+                } else {
+                    [1.0, 0.85, 0.2]
+                }
+            }
+            3 => match self.imagery_depth(key) {
+                0 => [0.25, 1.0, 0.4],
+                1 => [1.0, 0.85, 0.2],
+                2 => [1.0, 0.5, 0.15],
+                d if d > 2 => [1.0, 0.2, 0.2],
+                _ => [1.0, 0.2, 1.0],
+            },
+            4 => {
+                let h = slot.wrapping_mul(2_654_435_761);
+                [
+                    (0.25 + ((h >> 16) & 0xff) as f32 / 340.0).min(1.0),
+                    (0.25 + ((h >> 8) & 0xff) as f32 / 340.0).min(1.0),
+                    (0.25 + (h & 0xff) as f32 / 340.0).min(1.0),
+                ]
+            }
+            _ => return [0.0, 0.0, 0.0, 0.0],
+        };
+        [rgb[0], rgb[1], rgb[2], a]
     }
 
     fn uv_transform(key: TileKey, levels: u8) -> [f32; 4] {
@@ -491,6 +689,11 @@ impl TileTree {
 
     fn resolve_imagery(&mut self, key: TileKey) -> TileShading {
         let own = self.find_imagery(key, 0);
+        let coarse = if key.z > 0 {
+            self.find_imagery(key, 1)
+        } else {
+            None
+        };
         let mut shading = TileShading::default();
         match own {
             Some((layer, uvxf)) => {
@@ -499,18 +702,19 @@ impl TileTree {
                 shading.layer = layer;
                 shading.uvxf = uvxf;
                 shading.fade = (age / IMAGERY_FADE_FRAMES).clamp(0.0, 1.0) as f32;
-                if shading.fade < 1.0 && key.z > 0 {
-                    if let Some((prev, prev_uv)) = self.find_imagery(key, 1) {
+                match coarse {
+                    Some((prev, prev_uv)) if prev != layer => {
                         shading.prev_layer = prev;
                         shading.prev_uvxf = prev_uv;
                     }
-                } else {
-                    shading.prev_layer = layer;
-                    shading.prev_uvxf = uvxf;
+                    _ => {
+                        shading.prev_layer = layer;
+                        shading.prev_uvxf = uvxf;
+                    }
                 }
             }
             None => {
-                if let Some((prev, prev_uv)) = self.find_imagery(key, 1) {
+                if let Some((prev, prev_uv)) = coarse {
                     shading.prev_layer = prev;
                     shading.prev_uvxf = prev_uv;
                 }
@@ -521,6 +725,9 @@ impl TileTree {
     }
 
     fn request_mesh(&mut self, key: TileKey, pool: &mut WorkerPool, priority: f32) {
+        if self.frozen {
+            return;
+        }
         let frame = self.frame;
         let tile = self.tiles.entry(key).or_default();
         tile.last_used = frame;
@@ -535,8 +742,28 @@ impl TileTree {
         pool.request(JobKind::Terrain, key, url, uv, priority);
     }
 
+    fn covered_by_ancestor(&self, key: TileKey) -> bool {
+        let mut levels = 1;
+        loop {
+            let anc = key.ancestor(levels);
+            if self.tiles.get(&anc).is_some_and(|t| t.imagery.is_some()) {
+                return true;
+            }
+            if anc.z == 0 {
+                return false;
+            }
+            levels += 1;
+        }
+    }
+
     fn request_imagery(&mut self, key: TileKey, pool: &mut WorkerPool, priority: f32) {
+        if self.frozen {
+            return;
+        }
         if key.z > imagery_max_zoom() {
+            return;
+        }
+        if self.layer_pressure > ARENA_TRIM_HIGH && self.covered_by_ancestor(key) {
             return;
         }
         let frame = self.frame;
@@ -565,16 +792,26 @@ impl TileTree {
         budget: &mut UploadBudget,
         deferred: &mut Vec<crate::stream::Incoming>,
     ) {
+        if self.frozen {
+            return;
+        }
         for msg in pool.drain_inbox() {
+            if msg.cancelled {
+                continue;
+            }
             if matches!(msg.kind, JobKind::Model) {
                 self.models.push(msg);
+                continue;
+            }
+            if matches!(msg.kind, JobKind::Icon) {
+                self.icons.push(msg);
                 continue;
             }
             let tile = self.tiles.entry(msg.key).or_default();
             match msg.kind {
                 JobKind::Terrain => tile.mesh_inbound = true,
                 JobKind::Imagery => tile.imagery_inbound = true,
-                JobKind::Model => {}
+                JobKind::Model | JobKind::Icon => {}
             }
             deferred.push(msg);
         }
@@ -588,7 +825,7 @@ impl TileTree {
                 .map(|p| p.length() as usize)
                 .unwrap_or(0);
             match msg.kind {
-                JobKind::Model => {}
+                JobKind::Model | JobKind::Icon => {}
                 JobKind::Terrain => {
                     if !msg.ok {
                         let tile = self.tiles.entry(msg.key).or_default();
@@ -616,6 +853,7 @@ impl TileTree {
                     let replaced = tile.mesh.replace(MeshRes {
                         slot,
                         center: msg.center,
+                        min_height: msg.min_height,
                         max_height: msg.max_height,
                     });
                     if let Some(old) = replaced {
@@ -659,7 +897,7 @@ impl TileTree {
             match msg.kind {
                 JobKind::Terrain => tile.mesh_inbound = false,
                 JobKind::Imagery => tile.imagery_inbound = false,
-                JobKind::Model => {}
+                JobKind::Model | JobKind::Icon => {}
             }
             self.dropped_uploads += 1;
         }
@@ -678,12 +916,12 @@ impl TileTree {
     fn retire(&mut self, renderer: &mut TerrainRenderer) {
         let frame = self.frame;
         let pressed = self.mesh_pressure > ARENA_TRIM_HIGH || self.layer_pressure > ARENA_TRIM_HIGH;
-        let age = if self.camera_jumped {
-            RETIRE_JUMP_FRAMES
-        } else if pressed {
-            RETIRE_PRESSURE_FRAMES
-        } else {
+        let age = if !pressed {
             RETIRE_AFTER_FRAMES
+        } else if self.camera_jumped {
+            RETIRE_JUMP_FRAMES
+        } else {
+            RETIRE_PRESSURE_FRAMES
         };
         let mut meshes = 0;
         let mut layers = 0;

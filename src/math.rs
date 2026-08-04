@@ -78,13 +78,39 @@ pub fn reverse_z_infinite_perspective(fov_y: f32, aspect: f32, near: f32) -> Mat
     ])
 }
 
+pub fn ellipsoid_entry(eye: DVec3, dir: DVec3) -> Option<f64> {
+    let scale = DVec3::new(1.0 / WGS84_A, 1.0 / WGS84_A, 1.0 / WGS84_B);
+    let o = eye * scale;
+    let d = dir * scale;
+    let qa = d.dot(d);
+    let qb = 2.0 * o.dot(d);
+    let qc = o.dot(o) - 1.0;
+    let disc = qb * qb - 4.0 * qa * qc;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = (-qb - disc.sqrt()) / (2.0 * qa);
+    (t > 0.0).then_some(t)
+}
+
+pub fn horizon_distance(eye: DVec3) -> f64 {
+    let r = eye.length();
+    (r * r - MIN_RADIUS * MIN_RADIUS).max(0.0).sqrt()
+        + (2.0 * MIN_RADIUS * crate::tiling::MAX_TILE_HEIGHT).sqrt()
+}
+
+pub fn ray_far_distance(eye: DVec3, dir: DVec3) -> f64 {
+    ellipsoid_entry(eye, dir).unwrap_or_else(|| horizon_distance(eye))
+}
+
 pub struct Frustum {
     planes: [glam::Vec4; 6],
+    corners: [Vec3; 8],
 }
 
 impl Frustum {
-    pub fn from_view_proj(m: Mat4) -> Self {
-        let r = m.transpose();
+    pub fn from_camera(cam: &crate::camera::Camera) -> Self {
+        let r = cam.view_proj.transpose();
         let mut planes = [
             r.w_axis + r.x_axis,
             r.w_axis - r.x_axis,
@@ -97,12 +123,73 @@ impl Frustum {
             let len = Vec3::new(p.x, p.y, p.z).length().max(1e-9);
             *p /= len;
         }
-        Self { planes }
+
+        let forward = cam.ray(0.0, 0.0);
+        const STEPS: usize = 8;
+        const NDC: [(f64, f64); 4] = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+        let mut far = cam.near as f64 * 2.0;
+        let mut open_sky = false;
+        for i in 0..4 {
+            let (x0, y0) = NDC[i];
+            let (x1, y1) = NDC[(i + 1) % 4];
+            for j in 0..STEPS {
+                let t = j as f64 / STEPS as f64;
+                let dir = cam.ray(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+                match ellipsoid_entry(cam.eye, dir) {
+                    Some(hit) => far = far.max(hit * dir.dot(forward)),
+                    None => open_sky = true,
+                }
+            }
+        }
+        if open_sky {
+            far = far.max(horizon_distance(cam.eye));
+        }
+        far *= 1.02;
+        planes[5] = glam::Vec4::new(
+            -forward.x as f32,
+            -forward.y as f32,
+            -forward.z as f32,
+            far as f32,
+        );
+
+        let mut corners = [Vec3::ZERO; 8];
+        for (i, (x, y)) in NDC.iter().enumerate() {
+            let dir = cam.ray(*x, *y);
+            let axial = dir.dot(forward).max(1e-6);
+            corners[i] = (dir * (cam.near as f64 / axial)).as_vec3();
+            corners[i + 4] = (dir * (far / axial)).as_vec3();
+        }
+
+        Self { planes, corners }
     }
 
-    pub fn sphere_visible(&self, center: Vec3, radius: f32) -> bool {
-        for p in self.planes.iter().take(5) {
-            if p.x * center.x + p.y * center.y + p.z * center.z + p.w < -radius {
+    pub fn contains_point(&self, p: Vec3) -> bool {
+        self.planes
+            .iter()
+            .all(|pl| pl.x * p.x + pl.y * p.y + pl.z * p.z + pl.w >= 0.0)
+    }
+
+    pub fn box_visible(&self, center: Vec3, axes: [Vec3; 3], half: [f32; 3]) -> bool {
+        for p in self.planes.iter() {
+            let n = Vec3::new(p.x, p.y, p.z);
+            let r = half[0] * n.dot(axes[0]).abs()
+                + half[1] * n.dot(axes[1]).abs()
+                + half[2] * n.dot(axes[2]).abs();
+            if n.dot(center) + p.w < -r {
+                return false;
+            }
+        }
+        for i in 0..3 {
+            let d = center.dot(axes[i]);
+            let (lo, hi) = (d - half[i], d + half[i]);
+            let mut cmin = f32::INFINITY;
+            let mut cmax = f32::NEG_INFINITY;
+            for c in self.corners.iter() {
+                let t = c.dot(axes[i]);
+                cmin = cmin.min(t);
+                cmax = cmax.max(t);
+            }
+            if cmax < lo || cmin > hi {
                 return false;
             }
         }

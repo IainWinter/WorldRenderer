@@ -111,6 +111,33 @@
     border-color: var(--invert-bg);
   }
 
+  #stress {
+    display: none;
+    right: 10px;
+    bottom: 34px;
+    width: 232px;
+  }
+  body.debug #stress { display: block; }
+  #stress .panel-body { display: grid; gap: 6px; }
+  #stress .row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  #stress button { padding: 0 6px; font-size: 12px; }
+  #stress .note { color: var(--muted); font-size: 11px; }
+
+  #cull {
+    display: none;
+    left: 358px;
+    top: 10px;
+    width: 210px;
+  }
+  body.debug #cull { display: block; }
+  #cull .panel-body { display: grid; gap: 6px; }
+  #cull .row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  #cull button { padding: 0 6px; font-size: 12px; }
+  #cull .note { color: var(--muted); font-size: 11px; }
+  #cull .swatch { display: grid; gap: 2px; font-size: 11px; color: var(--muted); }
+  #cull .swatch > div { display: flex; align-items: center; gap: 6px; }
+  #cull .swatch i { width: 10px; height: 10px; display: block; }
+
   #help {
     bottom: 10px;
     left: 10px;
@@ -223,7 +250,52 @@
     </label>
     <button id="reset">reset view</button>
     <button id="debug-toggle">debug</button>
-    <button id="uncap-toggle">uncap fps</button>
+    <button id="uncap-toggle">uncap fps</button>  </div>
+</div>
+
+<div id="stress" class="panel">
+  <div class="panel-head">Stress</div>
+  <div class="panel-body">
+    <label>count per burst
+      <select id="stress-count">
+        <option value="25">25</option>
+        <option value="100" selected>100</option>
+        <option value="500">500</option>
+        <option value="2000">2000</option>
+      </select>
+    </label>
+    <div class="row">
+      <button id="stress-poly">polygons</button>
+      <button id="stress-line">lines</button>
+      <button id="stress-tube">tubes</button>
+      <button id="stress-icon">icons</button>
+      <button id="stress-plane">planes</button>
+      <button id="stress-beacon">beacons</button>
+      <button id="stress-clear-v">clear vectors</button>
+      <button id="stress-clear-m">clear models</button>
+    </div>
+    <div class="note" id="stress-note">bursts spawn around the current view</div>
+  </div>
+</div>
+
+<div id="cull" class="panel">
+  <div class="panel-head">Culling</div>
+  <div class="panel-body">
+    <div class="row">
+      <button id="freeze-cam-toggle">freeze camera</button>
+      <button id="freeze-work-toggle">freeze loading</button>
+    </div>
+    <div class="row">
+      <button id="tile-mode-0">off</button>
+      <button id="tile-mode-1">level</button>
+      <button id="tile-mode-2">load</button>
+      <button id="tile-mode-3">cache</button>
+      <button id="tile-mode-4">slot</button>
+      <button id="frustum-toggle">frustum</button>
+      <button id="bounds-toggle">bounds</button>
+    </div>
+    <div class="swatch" id="cull-key"></div>
+    <div class="note" id="cull-note">freeze camera holds the culling frustum &middot; freeze loading stops all streaming</div>
   </div>
 </div>
 
@@ -284,7 +356,11 @@ if (!navigator.gpu) {
     wr.set_orientation(0, 0);
   };
 
+  wr.load_icons('./assets/icons.png', 4, 1);
+
   const plane = wr.add_model('./assets/plane.glb');
+  const beacon = wr.add_model('./assets/beacon.glb');
+  const satellite = wr.add_model('./assets/satellite.glb');
   const routes = [
     { pts: [-0.45, 51.47, 10500, 2.55, 49.01, 10500, 13.29, 52.55, 10500, -0.45, 51.47, 10500],
       colour: 0xffe08aff, speed: 240, scale: 900 },
@@ -295,21 +371,49 @@ if (!navigator.gpu) {
     { pts: [151.2, -33.9, 10000, 174.8, -37.0, 10000, -122.4, 37.6, 10000, 151.2, -33.9, 10000],
       colour: 0x9affb0ff, speed: 280, scale: 1400 },
   ];
+  const beacons = [
+    { lon: 6.8652, lat: 45.8326, alt: 4900, scale: 90, colour: 0xffd75aff },
+    { lon: -112.1129, lat: 36.1069, alt: 2400, scale: 90, colour: 0x8affc8ff },
+    { lon: 138.7274, lat: 35.3606, alt: 3900, scale: 90, colour: 0xff8a8aff },
+  ];
+  const orbits = [
+    { pts: [-30, 10, 620000, 60, 25, 620000, 150, -5, 620000, -120, -20, 620000],
+      colour: 0xdfe8ffff, speed: 7500, scale: 45000 },
+  ];
   const waitForModel = setInterval(() => {
-    if (!wr.model_ready(plane)) return;
+    if (!wr.model_ready(plane) || !wr.model_ready(beacon) || !wr.model_ready(satellite)) return;
     clearInterval(waitForModel);
     for (const r of routes) {
       wr.add_flight(plane, new Float64Array(r.pts), r.speed, r.scale, r.colour);
     }
+    for (const b of beacons) {
+      wr.add_flight(beacon, new Float64Array([b.lon, b.lat, b.alt, b.lon, b.lat, b.alt]),
+        0, b.scale, b.colour);
+    }
+    for (const o of orbits) {
+      wr.add_flight(satellite, new Float64Array(o.pts), o.speed, o.scale, o.colour);
+    }
   }, 100);
 
-  wr.add_icons(new Float64Array([6.8652, 45.8326, 5200]), 26, 0xffd75aff);
+  wr.add_icons(new Float64Array([
+    6.8652, 45.8326, 5600,
+    6.7000, 45.8000, 4200,
+    7.0000, 45.8700, 4200,
+    6.8000, 45.9000, 4200,
+  ]), 26, 0xffd75aff, 1);
   wr.add_line(new Float64Array([
     6.60, 45.75, 3000,
     6.75, 45.80, 3600,
     6.8652, 45.8326, 4900,
     7.00, 45.87, 3600,
   ]), 3, 0x4ad6ffff);
+  wr.add_tube(new Float64Array([
+    6.60, 45.75, 2600,
+    6.72, 45.79, 3200,
+    6.8652, 45.8326, 4500,
+    7.00, 45.87, 3200,
+    7.10, 45.90, 2800,
+  ]), 120, 12, 0xff9a3cff);
   wr.add_polygon(new Float64Array([
     6.80, 45.78,
     6.94, 45.78,
@@ -335,9 +439,81 @@ if (!navigator.gpu) {
     wr.set_uncapped(uncapped);
     uncapToggle.classList.toggle('active', uncapped);
   };
+
   addEventListener('keydown', (e) => {
     if (e.key === '~' || e.key === '`') setDebug(!debugPanel.classList.contains('open'));
   });
+
+  const TILE_MODES = [
+    { name: 'off', key: [] },
+    { name: 'level', key: [['z3 …', '#4059ff'], ['z7 …', '#ffe633'], ['z11 …', '#ff4073'], ['z15 …', '#bf66ff']] },
+    { name: 'load', key: [['imagery resident', '#40ff66'], ['borrowed parent', '#ffd933'], ['in flight', '#4d8cff'], ['failed', '#ff2626']] },
+    { name: 'cache', key: [['exact level', '#40ff66'], ['1 level up', '#ffd933'], ['2 levels up', '#ff8026'], ['3+ / none', '#ff3333']] },
+    { name: 'slot', key: [['colour = mesh arena slot', '#8a8aa0']] },
+  ];
+  const freezeCamToggle = document.getElementById('freeze-cam-toggle');
+  const freezeWorkToggle = document.getElementById('freeze-work-toggle');
+  const frustumToggle = document.getElementById('frustum-toggle');
+  const boundsToggle = document.getElementById('bounds-toggle');
+  const cullNote = document.getElementById('cull-note');
+  const cullKey = document.getElementById('cull-key');
+  let frozenCam = false;
+  let frozenWork = false;
+  let tileMode = 0;
+  let showFrustum = true;
+  let showBounds = false;
+
+  function applyCull() {
+    wr.set_debug_freeze_camera(frozenCam);
+    wr.set_debug_freeze_work(frozenWork);
+    wr.set_tile_debug(tileMode);
+    wr.set_debug_frustum(showFrustum);
+    wr.set_debug_bounds(showBounds);
+    boundsToggle.classList.toggle('active', showBounds);
+    freezeCamToggle.classList.toggle('active', frozenCam);
+    freezeCamToggle.textContent = frozenCam ? 'camera frozen' : 'freeze camera';
+    freezeWorkToggle.classList.toggle('active', frozenWork);
+    freezeWorkToggle.textContent = frozenWork ? 'loading frozen' : 'freeze loading';
+    frustumToggle.classList.toggle('active', showFrustum);
+    for (let i = 0; i < TILE_MODES.length; i++) {
+      document.getElementById('tile-mode-' + i).classList.toggle('active', i === tileMode);
+    }
+    cullKey.innerHTML = TILE_MODES[tileMode].key
+      .map(([label, colour]) => `<div><i style="background:${colour}"></i>${label}</div>`).join('');
+  }
+  freezeCamToggle.onclick = () => { frozenCam = !frozenCam; applyCull(); };
+  freezeWorkToggle.onclick = () => { frozenWork = !frozenWork; applyCull(); };
+  frustumToggle.onclick = () => { showFrustum = !showFrustum; applyCull(); };
+  boundsToggle.onclick = () => { showBounds = !showBounds; applyCull(); };
+  for (let i = 0; i < TILE_MODES.length; i++) {
+    document.getElementById('tile-mode-' + i).onclick = () => { tileMode = i; applyCull(); };
+  }
+  applyCull();
+
+  const stressCount = document.getElementById('stress-count');
+  const stressNote = document.getElementById('stress-note');
+  const burst = () => Number(stressCount.value);
+
+  function runStress(label, fn) {
+    const t0 = performance.now();
+    const total = fn(burst());
+    stressNote.textContent = `${label}: ${burst()} in ${(performance.now() - t0).toFixed(1)} ms, ${total} live`;
+  }
+
+  document.getElementById('stress-poly').onclick = () => runStress('polygons', (n) => wr.stress_polygons(n));
+  document.getElementById('stress-line').onclick = () => runStress('lines', (n) => wr.stress_lines(n));
+  document.getElementById('stress-tube').onclick = () => runStress('tubes', (n) => wr.stress_tubes(n));
+  document.getElementById('stress-icon').onclick = () => runStress('icons', (n) => wr.stress_icons(n, 32));
+  document.getElementById('stress-plane').onclick = () => runStress('planes', (n) => wr.stress_models(plane, n, 400));
+  document.getElementById('stress-beacon').onclick = () => runStress('beacons', (n) => wr.stress_models(beacon, n, 60));
+  document.getElementById('stress-clear-v').onclick = () => {
+    wr.clear_vectors();
+    stressNote.textContent = 'vectors cleared';
+  };
+  document.getElementById('stress-clear-m').onclick = () => {
+    wr.clear_flights();
+    stressNote.textContent = 'model instances cleared';
+  };
 
   const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
   const bytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB'
@@ -390,6 +566,7 @@ if (!navigator.gpu) {
         ['loop', d.frame.uncapped ? 'uncapped' : 'vsync (raf)'],
         ['canvas', `${d.frame.width}x${d.frame.height}`],
         ['res scale', d.frame.scale.toFixed(2)],
+        ['dpr', d.frame.dpr.toFixed(2)],
       ])),
 
       section('Camera', rows([
@@ -463,8 +640,15 @@ if (!navigator.gpu) {
 
       section('Scene', rows([
         ['polygons', d.scene.polygons],
+        ['tubes', d.scene.tubes],
         ['lines', d.scene.lines],
         ['icon batches', d.scene.icons],
+        ['vector batches', `${d.scene.vectorBatches} / 4096`,
+          d.scene.vectorBatches > 4096 ? 'bad' : ''],
+        ['vector verts', d.scene.vectorVerts.toLocaleString()],
+        ['vector tris', d.scene.vectorTris.toLocaleString()],
+        ['icon sheet', d.scene.iconSheet ? 'loaded' : 'built-in',
+          d.scene.iconSheet ? 'ok' : ''],
         ['models', `${d.scene.modelsReady} / ${d.scene.models}`],
         ['model instances', d.scene.modelInstances],
         ['flights', d.scene.flights],
@@ -481,6 +665,16 @@ if (!navigator.gpu) {
       `hdg ${c[3].toFixed(0)}  tilt ${c[4].toFixed(0)}`;
     if (debugPanel.classList.contains('open')) {
       try { render(JSON.parse(wr.debug_json())); } catch (e) { debugBody.textContent = String(e); }
+      const v = JSON.parse(wr.debug_view_json());
+      const parts = [];
+      if (v.frozen) {
+        parts.push(`culling from ${v.frozenLon.toFixed(3)}, ${v.frozenLat.toFixed(3)} · ` +
+          `${(v.frozenDistance / 1000).toFixed(1)} km`);
+      }
+      parts.push(v.frozenWork ? 'loading stopped' : 'loading live');
+      cullNote.textContent = v.frozen || v.frozenWork
+        ? parts.join(' · ')
+        : 'freeze camera holds the culling frustum · freeze loading stops all streaming';
     }
   }, 200);
 }

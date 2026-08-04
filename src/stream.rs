@@ -13,6 +13,7 @@ pub enum JobKind {
     Terrain,
     Imagery,
     Model,
+    Icon,
 }
 
 impl JobKind {
@@ -21,6 +22,7 @@ impl JobKind {
             JobKind::Terrain => "terrain",
             JobKind::Imagery => "imagery",
             JobKind::Model => "model",
+            JobKind::Icon => "icon",
         }
     }
 }
@@ -29,7 +31,9 @@ pub struct Incoming {
     pub kind: JobKind,
     pub key: TileKey,
     pub ok: bool,
+    pub cancelled: bool,
     pub center: DVec3,
+    pub min_height: f32,
     pub max_height: f32,
     pub payload: Option<Uint8Array>,
 }
@@ -51,10 +55,12 @@ pub struct WorkerPool {
     queue: Vec<Request>,
     queued: HashSet<(JobKind, TileKey)>,
     max_in_flight: u32,
+    epoch: u32,
     pub dispatched: u32,
     pub dropped: u32,
     pub queue_depth: u32,
     pub sent_last: u32,
+    pub cancelled: u32,
     _handlers: Vec<Closure<dyn FnMut(MessageEvent)>>,
 }
 
@@ -109,6 +115,7 @@ impl WorkerPool {
                     "terrain" => JobKind::Terrain,
                     "imagery" => JobKind::Imagery,
                     "model" => JobKind::Model,
+                    "icon" => JobKind::Icon,
                     _ => return,
                 };
                 {
@@ -138,11 +145,13 @@ impl WorkerPool {
                     kind: job,
                     key,
                     ok: ok && payload.is_some(),
+                    cancelled: get_bool(&data, "cancelled"),
                     center: DVec3::new(
                         get_f64(&data, "cx"),
                         get_f64(&data, "cy"),
                         get_f64(&data, "cz"),
                     ),
+                    min_height: get_f64(&data, "hmin") as f32,
                     max_height: get_f64(&data, "hmax") as f32,
                     payload,
                 });
@@ -161,10 +170,12 @@ impl WorkerPool {
             queue: Vec::new(),
             queued: HashSet::new(),
             max_in_flight,
+            epoch: 0,
             dispatched: 0,
             dropped: 0,
             queue_depth: 0,
             sent_last: 0,
+            cancelled: 0,
             _handlers: handlers,
         })
     }
@@ -196,7 +207,7 @@ impl WorkerPool {
             match kind {
                 JobKind::Terrain => out.0 += 1,
                 JobKind::Imagery => out.1 += 1,
-                JobKind::Model => out.2 += 1,
+                JobKind::Model | JobKind::Icon => out.2 += 1,
             }
         }
         out
@@ -224,6 +235,29 @@ impl WorkerPool {
         });
     }
 
+    pub fn cancel_stale(&mut self) {
+        let live = self
+            .active
+            .borrow()
+            .iter()
+            .filter(|(kind, _)| matches!(kind, JobKind::Terrain | JobKind::Imagery))
+            .count();
+        if live == 0 {
+            return;
+        }
+        self.epoch += 1;
+        let msg = Object::new();
+        let _ = Reflect::set(&msg, &"kind".into(), &JsValue::from_str("cancel"));
+        let _ = Reflect::set(&msg, &"e".into(), &JsValue::from_f64(self.epoch as f64));
+        for worker in self.workers.iter() {
+            let _ = worker.post_message(&msg);
+        }
+        self.active
+            .borrow_mut()
+            .retain(|&(kind, _)| matches!(kind, JobKind::Model | JobKind::Icon));
+        self.cancelled += live as u32;
+    }
+
     pub fn dispatch(&mut self) {
         self.queue_depth = self.queue.len() as u32;
         if self.queue.is_empty() {
@@ -249,6 +283,7 @@ impl WorkerPool {
             let _ = Reflect::set(&msg, &"x".into(), &JsValue::from_f64(req.key.x as f64));
             let _ = Reflect::set(&msg, &"y".into(), &JsValue::from_f64(req.key.y as f64));
             let _ = Reflect::set(&msg, &"url".into(), &JsValue::from_str(&req.url));
+            let _ = Reflect::set(&msg, &"e".into(), &JsValue::from_f64(self.epoch as f64));
             let _ = Reflect::set(&msg, &"us".into(), &JsValue::from_f64(req.uv[0]));
             let _ = Reflect::set(&msg, &"u0".into(), &JsValue::from_f64(req.uv[1]));
             let _ = Reflect::set(&msg, &"v0".into(), &JsValue::from_f64(req.uv[2]));

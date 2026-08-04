@@ -1,19 +1,58 @@
 use crate::model::{encode, parse_glb};
-use crate::terrain_mesh::{build_mesh, decode_jpeg_rgba, decode_terrarium, Heightmap};
+use crate::terrain_mesh::{
+    build_mesh, decode_jpeg_rgba, decode_png_rgba, decode_terrarium, Heightmap,
+};
 use crate::tiling::TileKey;
 use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, Response};
+use web_sys::{
+    AbortController, AbortSignal, DedicatedWorkerGlobalScope, MessageEvent, RequestInit, Response,
+};
 
 thread_local! {
     static HEIGHT_CACHE: RefCell<VecDeque<(String, Rc<Heightmap>)>> = RefCell::new(VecDeque::new());
+    static EPOCH: Cell<u32> = const { Cell::new(0) };
+    static NEXT_ID: Cell<u32> = const { Cell::new(0) };
+    static PENDING: RefCell<Vec<(u32, u32, AbortController)>> = const { RefCell::new(Vec::new()) };
 }
 
 const HEIGHT_CACHE_LIMIT: usize = 24;
+
+fn stale(epoch: u32) -> bool {
+    EPOCH.with(|e| e.get()) > epoch
+}
+
+fn register(epoch: u32) -> Option<(u32, AbortController)> {
+    let ctrl = AbortController::new().ok()?;
+    let id = NEXT_ID.with(|n| {
+        let id = n.get();
+        n.set(id.wrapping_add(1));
+        id
+    });
+    PENDING.with(|p| p.borrow_mut().push((id, epoch, ctrl.clone())));
+    Some((id, ctrl))
+}
+
+fn unregister(id: u32) {
+    PENDING.with(|p| p.borrow_mut().retain(|(i, _, _)| *i != id));
+}
+
+fn abort_before(epoch: u32) {
+    PENDING.with(|p| {
+        p.borrow_mut().retain(|(_, e, ctrl)| {
+            if *e < epoch {
+                ctrl.abort();
+                false
+            } else {
+                true
+            }
+        })
+    });
+}
 
 fn cached_heightmap(url: &str) -> Option<Rc<Heightmap>> {
     HEIGHT_CACHE.with(|c| {
@@ -63,8 +102,10 @@ fn set(o: &Object, key: &str, v: &JsValue) {
     let _ = Reflect::set(o, &JsValue::from_str(key), v);
 }
 
-async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
-    let resp_value = JsFuture::from(scope().fetch_with_str(url)).await?;
+async fn fetch_bytes(url: &str, signal: Option<&AbortSignal>) -> Result<Vec<u8>, JsValue> {
+    let init = RequestInit::new();
+    init.set_signal(signal);
+    let resp_value = JsFuture::from(scope().fetch_with_str_and_init(url, &init)).await?;
     let resp: Response = resp_value.dyn_into()?;
     if !resp.ok() {
         return Err(JsValue::from_str("http error"));
@@ -97,22 +138,39 @@ fn post(msg: &Object, transfer: Option<&ArrayBuffer>) {
 }
 
 fn fail(kind: &str, key: TileKey) {
+    report(kind, key, false);
+}
+
+fn report(kind: &str, key: TileKey, cancelled: bool) {
     let out = Object::new();
     set(&out, "kind", &JsValue::from_str(kind));
     set(&out, "z", &JsValue::from_f64(key.z as f64));
     set(&out, "x", &JsValue::from_f64(key.x as f64));
     set(&out, "y", &JsValue::from_f64(key.y as f64));
     set(&out, "ok", &JsValue::from_bool(false));
+    set(&out, "cancelled", &JsValue::from_bool(cancelled));
     post(&out, None);
 }
 
-async fn do_terrain(key: TileKey, url: String, uv: [f64; 3]) {
+fn ended(kind: &str, key: TileKey, epoch: u32) {
+    report(kind, key, stale(epoch));
+}
+
+async fn do_terrain(key: TileKey, url: String, uv: [f64; 3], epoch: u32) {
+    if stale(epoch) {
+        return report("terrain", key, true);
+    }
     let hm = match cached_heightmap(&url) {
         Some(hm) => hm,
         None => {
-            let bytes = match fetch_bytes(&url).await {
+            let Some((id, ctrl)) = register(epoch) else {
+                return fail("terrain", key);
+            };
+            let fetched = fetch_bytes(&url, Some(&ctrl.signal())).await;
+            unregister(id);
+            let bytes = match fetched {
                 Ok(b) => b,
-                Err(_) => return fail("terrain", key),
+                Err(_) => return ended("terrain", key, epoch),
             };
             match decode_terrarium(&bytes) {
                 Ok(h) => {
@@ -143,10 +201,18 @@ async fn do_terrain(key: TileKey, url: String, uv: [f64; 3]) {
     post(&out, Some(&buffer));
 }
 
-async fn do_imagery(key: TileKey, url: String) {
-    let bytes = match fetch_bytes(&url).await {
+async fn do_imagery(key: TileKey, url: String, epoch: u32) {
+    if stale(epoch) {
+        return report("imagery", key, true);
+    }
+    let Some((id, ctrl)) = register(epoch) else {
+        return fail("imagery", key);
+    };
+    let fetched = fetch_bytes(&url, Some(&ctrl.signal())).await;
+    unregister(id);
+    let bytes = match fetched {
         Ok(b) => b,
-        Err(_) => return fail("imagery", key),
+        Err(_) => return ended("imagery", key, epoch),
     };
     let (w, h, rgba) = match decode_jpeg_rgba(&bytes) {
         Ok(v) => v,
@@ -167,7 +233,7 @@ async fn do_imagery(key: TileKey, url: String) {
 }
 
 async fn do_model(key: TileKey, url: String) {
-    let bytes = match fetch_bytes(&url).await {
+    let bytes = match fetch_bytes(&url, None).await {
         Ok(b) => b,
         Err(_) => return fail("model", key),
     };
@@ -188,11 +254,43 @@ async fn do_model(key: TileKey, url: String) {
     post(&out, Some(&buffer));
 }
 
+async fn do_icon(key: TileKey, url: String) {
+    let bytes = match fetch_bytes(&url, None).await {
+        Ok(b) => b,
+        Err(_) => return fail("icon", key),
+    };
+    let (w, h, rgba) = match decode_png_rgba(&bytes).or_else(|_| decode_jpeg_rgba(&bytes)) {
+        Ok(v) => v,
+        Err(_) => return fail("icon", key),
+    };
+    let mut blob = Vec::with_capacity(8 + rgba.len());
+    blob.extend_from_slice(&w.to_le_bytes());
+    blob.extend_from_slice(&h.to_le_bytes());
+    blob.extend_from_slice(&rgba);
+    let arr = to_transferable(&blob);
+    let out = Object::new();
+    set(&out, "kind", &JsValue::from_str("icon"));
+    set(&out, "z", &JsValue::from_f64(key.z as f64));
+    set(&out, "x", &JsValue::from_f64(key.x as f64));
+    set(&out, "y", &JsValue::from_f64(key.y as f64));
+    set(&out, "ok", &JsValue::from_bool(true));
+    set(&out, "verts", &arr);
+    let buffer = arr.buffer();
+    post(&out, Some(&buffer));
+}
+
 #[wasm_bindgen]
 pub fn worker_main() {
     console_error_panic_hook::set_once();
     let handler = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
         let data = e.data();
+        let kind = get_str(&data, "kind");
+        let epoch = get_u32(&data, "e");
+        if kind == "cancel" {
+            EPOCH.with(|c| c.set(epoch));
+            abort_before(epoch);
+            return;
+        }
         let key = TileKey {
             z: get_u32(&data, "z") as u8,
             x: get_u32(&data, "x"),
@@ -204,10 +302,11 @@ pub fn worker_main() {
             get_f64(&data, "u0"),
             get_f64(&data, "v0"),
         ];
-        match get_str(&data, "kind").as_str() {
-            "terrain" => wasm_bindgen_futures::spawn_local(do_terrain(key, url, uv)),
-            "imagery" => wasm_bindgen_futures::spawn_local(do_imagery(key, url)),
+        match kind.as_str() {
+            "terrain" => wasm_bindgen_futures::spawn_local(do_terrain(key, url, uv, epoch)),
+            "imagery" => wasm_bindgen_futures::spawn_local(do_imagery(key, url, epoch)),
             "model" => wasm_bindgen_futures::spawn_local(do_model(key, url)),
+            "icon" => wasm_bindgen_futures::spawn_local(do_icon(key, url)),
             _ => {}
         }
     });

@@ -10,7 +10,8 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    AbortController, AbortSignal, DedicatedWorkerGlobalScope, MessageEvent, RequestInit, Response,
+    AbortController, AbortSignal, Cache, DedicatedWorkerGlobalScope, MessageEvent, Request,
+    RequestInit, Response,
 };
 
 thread_local! {
@@ -18,9 +19,16 @@ thread_local! {
     static EPOCH: Cell<u32> = const { Cell::new(0) };
     static NEXT_ID: Cell<u32> = const { Cell::new(0) };
     static PENDING: RefCell<Vec<(u32, u32, AbortController)>> = const { RefCell::new(Vec::new()) };
+    static DISK_MB: Cell<f64> = const { Cell::new(DEFAULT_DISK_MB) };
+    static PUTS: Cell<u32> = const { Cell::new(0) };
+    static SWEEPING: Cell<bool> = const { Cell::new(false) };
 }
 
 const HEIGHT_CACHE_LIMIT: usize = 24;
+pub const DISK_CACHE_NAME: &str = "worldrenderer-tiles-v1";
+const DEFAULT_DISK_MB: f64 = 16384.0;
+const SWEEP_EVERY: u32 = 64;
+const SWEEP_TARGET: f64 = 0.9;
 
 fn stale(epoch: u32) -> bool {
     EPOCH.with(|e| e.get()) > epoch
@@ -102,7 +110,93 @@ fn set(o: &Object, key: &str, v: &JsValue) {
     let _ = Reflect::set(o, &JsValue::from_str(key), v);
 }
 
-async fn fetch_bytes(url: &str, signal: Option<&AbortSignal>) -> Result<Vec<u8>, JsValue> {
+async fn open_disk_cache() -> Option<Cache> {
+    if DISK_MB.with(|m| m.get()) <= 0.0 {
+        return None;
+    }
+    let caches = scope().caches().ok()?;
+    JsFuture::from(caches.open(DISK_CACHE_NAME))
+        .await
+        .ok()?
+        .dyn_into::<Cache>()
+        .ok()
+}
+
+async fn usage_bytes() -> Option<f64> {
+    let est = JsFuture::from(scope().navigator().storage().estimate().ok()?)
+        .await
+        .ok()?;
+    Reflect::get(&est, &JsValue::from_str("usage"))
+        .ok()?
+        .as_f64()
+}
+
+async fn sweep_disk_cache() {
+    let limit = DISK_MB.with(|m| m.get()) * 1_048_576.0;
+    let Some(used) = usage_bytes().await else {
+        return;
+    };
+    if used <= limit {
+        return;
+    }
+    let Some(cache) = open_disk_cache().await else {
+        return;
+    };
+    let Ok(keys) = JsFuture::from(cache.keys()).await else {
+        return;
+    };
+    let keys = Array::from(&keys);
+    let total = keys.length();
+    if total == 0 {
+        return;
+    }
+    let fraction = 1.0 - (limit * SWEEP_TARGET / used).min(1.0);
+    let victims = ((total as f64 * fraction).ceil() as u32).min(total);
+    for i in 0..victims {
+        let req: Request = keys.get(i).unchecked_into();
+        let _ = JsFuture::from(cache.delete_with_request(&req)).await;
+    }
+}
+
+async fn maybe_sweep() {
+    let n = PUTS.with(|p| {
+        let v = p.get().wrapping_add(1);
+        p.set(v);
+        v
+    });
+    if n % SWEEP_EVERY != 0 || SWEEPING.with(|s| s.get()) {
+        return;
+    }
+    SWEEPING.with(|s| s.set(true));
+    sweep_disk_cache().await;
+    SWEEPING.with(|s| s.set(false));
+}
+
+pub struct Fetched {
+    pub bytes: Vec<u8>,
+    pub ms: f64,
+    pub hit: bool,
+}
+
+fn now_ms() -> f64 {
+    scope().performance().map(|p| p.now()).unwrap_or(0.0)
+}
+
+async fn fetch_bytes(url: &str, signal: Option<&AbortSignal>) -> Result<Fetched, JsValue> {
+    let t0 = now_ms();
+    let cache = open_disk_cache().await;
+    if let Some(cache) = &cache {
+        if let Ok(hit) = JsFuture::from(cache.match_with_str(url)).await {
+            if let Ok(resp) = hit.dyn_into::<Response>() {
+                let buf = JsFuture::from(resp.array_buffer()?).await?;
+                return Ok(Fetched {
+                    bytes: Uint8Array::new(&buf).to_vec(),
+                    ms: now_ms() - t0,
+                    hit: true,
+                });
+            }
+        }
+    }
     let init = RequestInit::new();
     init.set_signal(signal);
     let resp_value = JsFuture::from(scope().fetch_with_str_and_init(url, &init)).await?;
@@ -110,9 +204,26 @@ async fn fetch_bytes(url: &str, signal: Option<&AbortSignal>) -> Result<Vec<u8>,
     if !resp.ok() {
         return Err(JsValue::from_str("http error"));
     }
+    if let Some(cache) = cache {
+        if let Ok(copy) = resp.clone() {
+            let url = url.to_string();
+            wasm_bindgen_futures::spawn_local(async move {
+                if JsFuture::from(cache.put_with_str(&url, &copy))
+                    .await
+                    .is_ok()
+                {
+                    maybe_sweep().await;
+                }
+            });
+        }
+    }
     let buf = JsFuture::from(resp.array_buffer()?).await?;
     let arr = Uint8Array::new(&buf);
-    Ok(arr.to_vec())
+    Ok(Fetched {
+        bytes: arr.to_vec(),
+        ms: now_ms() - t0,
+        hit: false,
+    })
 }
 
 use wasm_bindgen_futures::JsFuture;
@@ -152,6 +263,12 @@ fn report(kind: &str, key: TileKey, cancelled: bool) {
     post(&out, None);
 }
 
+fn stamp(out: &Object, fetch_ms: f64, work_ms: f64, hit: bool) {
+    set(out, "fms", &JsValue::from_f64(fetch_ms));
+    set(out, "wms", &JsValue::from_f64(work_ms));
+    set(out, "hit", &JsValue::from_bool(hit));
+}
+
 fn ended(kind: &str, key: TileKey, epoch: u32) {
     report(kind, key, stale(epoch));
 }
@@ -160,6 +277,9 @@ async fn do_terrain(key: TileKey, url: String, uv: [f64; 3], epoch: u32) {
     if stale(epoch) {
         return report("terrain", key, true);
     }
+    let mut fetch_ms = 0.0;
+    let mut hit = true;
+    let mut decode_ms = 0.0;
     let hm = match cached_heightmap(&url) {
         Some(hm) => hm,
         None => {
@@ -168,21 +288,28 @@ async fn do_terrain(key: TileKey, url: String, uv: [f64; 3], epoch: u32) {
             };
             let fetched = fetch_bytes(&url, Some(&ctrl.signal())).await;
             unregister(id);
-            let bytes = match fetched {
+            let fetched = match fetched {
                 Ok(b) => b,
                 Err(_) => return ended("terrain", key, epoch),
             };
-            match decode_terrarium(&bytes) {
+            fetch_ms = fetched.ms;
+            hit = fetched.hit;
+            let t = now_ms();
+            let out = match decode_terrarium(&fetched.bytes) {
                 Ok(h) => {
                     let hm = Rc::new(h);
                     store_heightmap(&url, hm.clone());
                     hm
                 }
                 Err(_) => return fail("terrain", key),
-            }
+            };
+            decode_ms = now_ms() - t;
+            out
         }
     };
+    let t = now_ms();
     let mesh = build_mesh(key, &hm, uv);
+    let work_ms = decode_ms + (now_ms() - t);
     let raw: &[u8] = bytemuck::cast_slice(&mesh.vertices);
     let arr = to_transferable(raw);
     let out = Object::new();
@@ -196,6 +323,12 @@ async fn do_terrain(key: TileKey, url: String, uv: [f64; 3], epoch: u32) {
     set(&out, "cz", &JsValue::from_f64(mesh.center.z));
     set(&out, "hmin", &JsValue::from_f64(mesh.min_height as f64));
     set(&out, "hmax", &JsValue::from_f64(mesh.max_height as f64));
+    set(
+        &out,
+        "heights",
+        &js_sys::Float32Array::from(mesh.heights.as_slice()),
+    );
+    stamp(&out, fetch_ms, work_ms, hit);
     set(&out, "verts", &arr);
     let buffer = arr.buffer();
     post(&out, Some(&buffer));
@@ -210,14 +343,16 @@ async fn do_imagery(key: TileKey, url: String, epoch: u32) {
     };
     let fetched = fetch_bytes(&url, Some(&ctrl.signal())).await;
     unregister(id);
-    let bytes = match fetched {
+    let fetched = match fetched {
         Ok(b) => b,
         Err(_) => return ended("imagery", key, epoch),
     };
-    let (w, h, rgba) = match decode_jpeg_rgba(&bytes) {
+    let t = now_ms();
+    let (w, h, rgba) = match decode_jpeg_rgba(&fetched.bytes) {
         Ok(v) => v,
         Err(_) => return fail("imagery", key),
     };
+    let work_ms = now_ms() - t;
     let arr = to_transferable(&rgba);
     let out = Object::new();
     set(&out, "kind", &JsValue::from_str("imagery"));
@@ -228,20 +363,23 @@ async fn do_imagery(key: TileKey, url: String, epoch: u32) {
     set(&out, "w", &JsValue::from_f64(w as f64));
     set(&out, "h", &JsValue::from_f64(h as f64));
     set(&out, "pixels", &arr);
+    stamp(&out, fetched.ms, work_ms, fetched.hit);
     let buffer = arr.buffer();
     post(&out, Some(&buffer));
 }
 
 async fn do_model(key: TileKey, url: String) {
-    let bytes = match fetch_bytes(&url, None).await {
+    let fetched = match fetch_bytes(&url, None).await {
         Ok(b) => b,
         Err(_) => return fail("model", key),
     };
-    let data = match parse_glb(&bytes) {
+    let t = now_ms();
+    let data = match parse_glb(&fetched.bytes) {
         Ok(d) => d,
         Err(_) => return fail("model", key),
     };
     let blob = encode(&data);
+    let work_ms = now_ms() - t;
     let arr = to_transferable(&blob);
     let out = Object::new();
     set(&out, "kind", &JsValue::from_str("model"));
@@ -250,23 +388,27 @@ async fn do_model(key: TileKey, url: String) {
     set(&out, "y", &JsValue::from_f64(key.y as f64));
     set(&out, "ok", &JsValue::from_bool(true));
     set(&out, "verts", &arr);
+    stamp(&out, fetched.ms, work_ms, fetched.hit);
     let buffer = arr.buffer();
     post(&out, Some(&buffer));
 }
 
 async fn do_icon(key: TileKey, url: String) {
-    let bytes = match fetch_bytes(&url, None).await {
+    let fetched = match fetch_bytes(&url, None).await {
         Ok(b) => b,
         Err(_) => return fail("icon", key),
     };
-    let (w, h, rgba) = match decode_png_rgba(&bytes).or_else(|_| decode_jpeg_rgba(&bytes)) {
-        Ok(v) => v,
-        Err(_) => return fail("icon", key),
-    };
+    let t = now_ms();
+    let (w, h, rgba) =
+        match decode_png_rgba(&fetched.bytes).or_else(|_| decode_jpeg_rgba(&fetched.bytes)) {
+            Ok(v) => v,
+            Err(_) => return fail("icon", key),
+        };
     let mut blob = Vec::with_capacity(8 + rgba.len());
     blob.extend_from_slice(&w.to_le_bytes());
     blob.extend_from_slice(&h.to_le_bytes());
     blob.extend_from_slice(&rgba);
+    let work_ms = now_ms() - t;
     let arr = to_transferable(&blob);
     let out = Object::new();
     set(&out, "kind", &JsValue::from_str("icon"));
@@ -275,6 +417,7 @@ async fn do_icon(key: TileKey, url: String) {
     set(&out, "y", &JsValue::from_f64(key.y as f64));
     set(&out, "ok", &JsValue::from_bool(true));
     set(&out, "verts", &arr);
+    stamp(&out, fetched.ms, work_ms, fetched.hit);
     let buffer = arr.buffer();
     post(&out, Some(&buffer));
 }
@@ -286,6 +429,11 @@ pub fn worker_main() {
         let data = e.data();
         let kind = get_str(&data, "kind");
         let epoch = get_u32(&data, "e");
+        if kind == "cachelimit" {
+            DISK_MB.with(|m| m.set(get_f64(&data, "mb").max(0.0)));
+            wasm_bindgen_futures::spawn_local(sweep_disk_cache());
+            return;
+        }
         if kind == "cancel" {
             EPOCH.with(|c| c.set(epoch));
             abort_before(epoch);

@@ -93,6 +93,25 @@ pub fn ellipsoid_entry(eye: DVec3, dir: DVec3) -> Option<f64> {
     (t > 0.0).then_some(t)
 }
 
+pub fn ellipsoid_entry_at(eye: DVec3, dir: DVec3, height: f64) -> Option<f64> {
+    let scale = DVec3::new(
+        1.0 / (WGS84_A + height),
+        1.0 / (WGS84_A + height),
+        1.0 / (WGS84_B + height),
+    );
+    let o = eye * scale;
+    let d = dir * scale;
+    let qa = d.dot(d);
+    let qb = 2.0 * o.dot(d);
+    let qc = o.dot(o) - 1.0;
+    let disc = qb * qb - 4.0 * qa * qc;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = (-qb - disc.sqrt()) / (2.0 * qa);
+    (t > 0.0).then_some(t)
+}
+
 pub fn horizon_distance(eye: DVec3) -> f64 {
     let r = eye.length();
     (r * r - MIN_RADIUS * MIN_RADIUS).max(0.0).sqrt()

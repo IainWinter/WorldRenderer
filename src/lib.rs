@@ -8,6 +8,7 @@ mod stream;
 mod terrain_gpu;
 mod terrain_mesh;
 mod tiling;
+mod tool;
 mod vector;
 mod worker;
 
@@ -20,6 +21,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use stream::{Incoming, WorkerPool};
 use terrain_gpu::TerrainRenderer;
+use tool::{Tool, ToolContext};
 use vector::VectorRenderer;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -36,7 +38,7 @@ struct Input {
     rotating: bool,
     last_x: f64,
     last_y: f64,
-    keys: [bool; 8],
+    keys: [bool; 10],
 }
 
 struct Flight {
@@ -68,6 +70,7 @@ struct App {
     deferred: Vec<Incoming>,
     canvas: HtmlCanvasElement,
     input: Input,
+    tool: Option<Box<dyn Tool>>,
     resolution_scale: f64,
     frames: u32,
     last_frame_time: f64,
@@ -147,6 +150,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
         deferred: Vec::new(),
         canvas: canvas.clone(),
         input: Input::default(),
+        tool: None,
         resolution_scale: 1.0,
         frames: 0,
         last_frame_time: now(),
@@ -174,6 +178,13 @@ fn ndc(app: &App, client_x: f64, client_y: f64) -> (f64, f64) {
     (x, y)
 }
 
+fn pointer_locked() -> bool {
+    window()
+        .document()
+        .and_then(|d| d.pointer_lock_element())
+        .is_some()
+}
+
 fn key_index(code: &str) -> Option<usize> {
     match code {
         "KeyW" | "ArrowUp" => Some(0),
@@ -184,6 +195,8 @@ fn key_index(code: &str) -> Option<usize> {
         "KeyE" => Some(5),
         "KeyR" => Some(6),
         "KeyF" => Some(7),
+        "Space" => Some(8),
+        "ShiftLeft" | "ShiftRight" => Some(9),
         _ => None,
     }
 }
@@ -196,6 +209,17 @@ fn install_input(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
                 let (x, y) = ndc(app, e.client_x() as f64, e.client_y() as f64);
                 app.input.last_x = e.client_x() as f64;
                 app.input.last_y = e.client_y() as f64;
+                if app.tool_event(|tool, ctx| tool.pointer_down(ctx, x, y, e.button())) {
+                    return;
+                }
+                if app.camera.fps {
+                    if !pointer_locked() {
+                        let _ = app.canvas.request_pointer_lock();
+                    }
+                    app.input.rotating = false;
+                    app.input.panning = e.button() == 0;
+                    return;
+                }
                 let tilt = e.button() == 2 || e.button() == 1 || e.shift_key() || e.ctrl_key();
                 app.input.rotating = tilt;
                 app.input.panning = !tilt && e.button() == 0;
@@ -212,6 +236,7 @@ fn install_input(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
     let up = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(move |_e| {
         with_app(
             |app| {
+                app.tool_event(|tool, ctx| tool.pointer_up(ctx));
                 app.input.panning = false;
                 app.input.rotating = false;
                 app.camera.grab_end();
@@ -234,7 +259,18 @@ fn install_input(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
                     let dy = cy - app.input.last_y;
                     app.input.last_x = cx;
                     app.input.last_y = cy;
-                    if app.input.rotating {
+                    let (nx, ny) = ndc(app, cx, cy);
+                    if app.tool_event(|tool, ctx| tool.pointer_move(ctx, nx, ny)) {
+                        return;
+                    }
+                    if app.camera.fps {
+                        if pointer_locked() {
+                            app.camera
+                                .look(e.movement_x() as f64, e.movement_y() as f64);
+                        } else if app.input.panning {
+                            app.camera.look(dx, dy);
+                        }
+                    } else if app.input.rotating {
                         app.camera.rotate(dx, dy);
                     } else if app.input.panning {
                         let (x, y) = ndc(app, cx, cy);
@@ -259,7 +295,11 @@ fn install_input(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
                 if e.delta_mode() == 1 {
                     delta *= 16.0;
                 }
-                app.camera.zoom_at(x, y, delta);
+                if app.camera.fps {
+                    app.camera.adjust_speed(delta);
+                } else {
+                    app.camera.zoom_at(x, y, delta);
+                }
             },
             (),
         );
@@ -343,6 +383,21 @@ fn start_loop() {
 }
 
 impl App {
+    fn tool_event(&mut self, f: impl FnOnce(&mut dyn Tool, &mut ToolContext) -> bool) -> bool {
+        let Some(mut tool) = self.tool.take() else {
+            return false;
+        };
+        let mut ctx = ToolContext {
+            gpu: &self.gpu,
+            camera: &self.camera,
+            tree: &self.tree,
+            vectors: &mut self.vectors,
+        };
+        let consumed = f(tool.as_mut(), &mut ctx);
+        self.tool = Some(tool);
+        consumed
+    }
+
     fn sync_size(&mut self) {
         let dpr = device_pixel_ratio() * self.resolution_scale;
         let w = (self.canvas.client_width().max(1) as f64 * dpr) as u32;
@@ -356,6 +411,13 @@ impl App {
 
     fn apply_keys(&mut self, dt: f64) {
         let k = &self.input.keys;
+        if self.camera.fps {
+            let fwd = (k[0] as i32 - k[1] as i32) as f64;
+            let right = (k[3] as i32 - k[2] as i32) as f64;
+            let up = (k[8] as i32 - k[9] as i32) as f64;
+            self.camera.fly(fwd, right, up, dt);
+            return;
+        }
         let step = dt * 60.0;
         let fwd = (k[0] as i32 - k[1] as i32) as f64 * step;
         let right = (k[3] as i32 - k[2] as i32) as f64 * step;
@@ -381,7 +443,7 @@ impl App {
         self.apply_keys(dt);
         let (eye_lon, eye_lat) = math::dir_to_geodetic(self.camera.eye);
         self.camera.ground_clearance =
-            self.tree.ground_height(eye_lon, eye_lat) + MIN_GROUND_CLEARANCE;
+            self.tree.ground_ceiling(eye_lon, eye_lat) + MIN_GROUND_CLEARANCE;
         self.camera.update(self.gpu.aspect(), dt);
 
         self.budget.reset();
@@ -678,8 +740,20 @@ pub fn set_uncapped(uncapped: bool) {
 pub fn stats() -> String {
     with_app(
         |app| {
+            let s = app.pool.load_stats();
+            let n: u32 = s.iter().map(|k| k.n).sum();
+            let hits: u32 = s.iter().map(|k| k.hits).sum();
+            let tile_avg = if s[0].n > 0 { s[0].avg_ms } else { 0.0 };
+            let tile_hit_pct = if n > 0 {
+                100.0 * hits as f64 / n as f64
+            } else {
+                0.0
+            };
             format!(
-                "{:.0} fps | {:.1} ms | z{} | {} drawn | {} meshes | {} imagery | {} in flight",
+                concat!(
+                    "{:.0} fps | {:.1} ms | z{} | {} drawn | {} meshes | {} imagery | ",
+                    "{} in flight | tile {:.0} ms ({:.0}% cached)"
+                ),
                 app.fps,
                 app.frame_ms,
                 app.tree.max_level_drawn,
@@ -687,6 +761,8 @@ pub fn stats() -> String {
                 app.tree.resident_tiles(),
                 app.tree.resident_imagery(),
                 app.pool.active_count(),
+                tile_avg,
+                tile_hit_pct,
             )
         },
         "starting".to_string(),
@@ -751,6 +827,31 @@ pub fn debug_json() -> String {
                 .iter()
                 .map(|(ready, flight)| format!("{{\"ready\":{},\"inFlight\":{}}}", ready, flight))
                 .collect();
+            let stats = app.pool.load_stats();
+            let loads: Vec<String> = stream::JOB_KINDS
+                .iter()
+                .zip(stats.iter())
+                .filter(|(_, s)| s.n > 0)
+                .map(|(kind, s)| {
+                    format!(
+                        concat!(
+                            "{{\"kind\":\"{}\",\"n\":{},\"failed\":{},\"hitPct\":{:.0},",
+                            "\"lastMs\":{:.0},\"avgMs\":{:.0},\"maxMs\":{:.0},",
+                            "\"fetchMs\":{:.0},\"workMs\":{:.0},\"queueMs\":{:.0}}}"
+                        ),
+                        kind.label(),
+                        s.n,
+                        s.failed,
+                        100.0 * s.hits as f64 / s.n as f64,
+                        s.last_ms,
+                        s.avg_ms,
+                        s.max_ms,
+                        s.fetch_ms,
+                        s.work_ms,
+                        s.queue_ms,
+                    )
+                })
+                .collect();
             let batches = app.vectors.totals();
             let model_instances: usize = app.models.models.iter().map(|m| m.live.len()).sum();
             let models_ready = (0..app.model_urls.len())
@@ -780,7 +881,7 @@ pub fn debug_json() -> String {
                     "\"scene\":{{\"polygons\":{},\"tubes\":{},\"lines\":{},\"icons\":{},",
                     "\"vectorVerts\":{},\"vectorTris\":{},\"vectorBatches\":{},\"iconSheet\":{},",
                     "\"models\":{},\"modelsReady\":{},\"modelInstances\":{},\"flights\":{}}},",
-                    "\"levels\":[{}],\"workers\":[{}]}}"
+                    "\"levels\":[{}],\"workers\":[{}],\"loads\":[{}]}}"
                 ),
                 app.fps,
                 app.frame_ms,
@@ -863,10 +964,42 @@ pub fn debug_json() -> String {
                 app.flights.len(),
                 levels.join(","),
                 workers.join(","),
+                loads.join(","),
             )
         },
         "{}".to_string(),
     )
+}
+
+#[wasm_bindgen]
+pub fn set_fps(on: bool) {
+    with_app(
+        |app| {
+            app.camera.set_fps(on);
+            app.input.panning = false;
+            app.input.rotating = false;
+            app.input.keys = [false; 10];
+            if !on {
+                if let Some(d) = window().document() {
+                    d.exit_pointer_lock();
+                }
+            }
+        },
+        (),
+    );
+}
+
+#[wasm_bindgen]
+pub fn set_move_speed(speed: f64) {
+    with_app(
+        |app| app.camera.move_speed = speed.clamp(camera::MIN_MOVE_SPEED, camera::MAX_MOVE_SPEED),
+        (),
+    );
+}
+
+#[wasm_bindgen]
+pub fn move_speed() -> f64 {
+    with_app(|app| app.camera.move_speed, 0.0)
 }
 
 #[wasm_bindgen]
@@ -898,6 +1031,45 @@ pub fn pick(ndc_x: f64, ndc_y: f64) -> Vec<f64> {
                 let (lon, lat) = math::dir_to_geodetic(dir);
                 vec![lon.to_degrees(), lat.to_degrees()]
             }
+            None => Vec::new(),
+        },
+        Vec::new(),
+    )
+}
+
+#[wasm_bindgen]
+pub fn set_tool(name: String) -> bool {
+    with_app(
+        |app| {
+            if let Some(mut old) = app.tool.take() {
+                let mut ctx = ToolContext {
+                    gpu: &app.gpu,
+                    camera: &app.camera,
+                    tree: &app.tree,
+                    vectors: &mut app.vectors,
+                };
+                old.detach(&mut ctx);
+            }
+            app.tool = tool::make(&name);
+            app.tool.is_some()
+        },
+        false,
+    )
+}
+
+#[wasm_bindgen]
+pub fn tool_positions() -> Vec<f64> {
+    with_app(
+        |app| app.tool.as_ref().map(|t| t.positions()).unwrap_or_default(),
+        Vec::new(),
+    )
+}
+
+#[wasm_bindgen]
+pub fn tool_position() -> Vec<f64> {
+    with_app(
+        |app| match app.tool.as_ref().and_then(|t| t.position()) {
+            Some((lon, lat, height)) => vec![lon.to_degrees(), lat.to_degrees(), height],
             None => Vec::new(),
         },
         Vec::new(),
@@ -992,7 +1164,7 @@ pub fn set_debug_bounds(show: bool) {
 
 #[wasm_bindgen]
 pub fn set_tile_debug(mode: u32) {
-    with_app(|app| app.tree.debug_mode = mode.min(4), ());
+    with_app(|app| app.tree.debug_mode = mode.min(5), ());
 }
 
 #[wasm_bindgen]
@@ -1080,6 +1252,33 @@ pub fn set_terrain(url_template: String, max_zoom: u32) {
         },
         (),
     );
+}
+
+#[wasm_bindgen]
+pub fn set_cache_limit_mb(mb: f64) {
+    with_app(|app| app.pool.set_cache_limit_mb(mb.max(0.0)), ());
+}
+
+#[wasm_bindgen]
+pub fn clear_cache() {
+    if let Ok(caches) = window().caches() {
+        let _ = caches.delete(worker::DISK_CACHE_NAME);
+    }
+}
+
+#[wasm_bindgen]
+pub fn cache_usage_mb() -> js_sys::Promise {
+    let Ok(storage) = window().navigator().storage().estimate() else {
+        return js_sys::Promise::resolve(&JsValue::from_f64(-1.0));
+    };
+    wasm_bindgen_futures::future_to_promise(async move {
+        let est = wasm_bindgen_futures::JsFuture::from(storage).await?;
+        let used = js_sys::Reflect::get(&est, &JsValue::from_str("usage"))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        Ok(JsValue::from_f64(used / 1_048_576.0))
+    })
 }
 
 #[wasm_bindgen]

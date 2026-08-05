@@ -8,6 +8,10 @@ pub const MIN_DISTANCE: f64 = 30.0;
 pub const MAX_DISTANCE: f64 = 40_000_000.0;
 pub const MAX_LAT: f64 = 1.4835;
 pub const MAX_TILT: f64 = 1.45;
+pub const FPS_MIN_TILT: f64 = 0.02;
+pub const FPS_MAX_TILT: f64 = std::f64::consts::PI - 0.02;
+pub const MIN_MOVE_SPEED: f64 = 0.5;
+pub const MAX_MOVE_SPEED: f64 = 2_000_000.0;
 
 fn base_frame() -> DQuat {
     DQuat::from_axis_angle(DVec3::ONE.normalize(), std::f64::consts::TAU / 3.0)
@@ -41,6 +45,8 @@ pub struct Camera {
     pub near: f32,
     pub aspect: f32,
     pub ground_clearance: f64,
+    pub fps: bool,
+    pub move_speed: f64,
     grab: Option<DVec3>,
 }
 
@@ -64,6 +70,8 @@ impl Camera {
             near: 1.0,
             aspect: 1.0,
             ground_clearance: 0.0,
+            fps: false,
+            move_speed: 200.0,
             grab: None,
         }
     }
@@ -87,6 +95,10 @@ impl Camera {
     pub fn set_view(&mut self, lon: f64, lat: f64, distance: f64) {
         self.target_anchor = anchor_at(lon, lat.clamp(-MAX_LAT, MAX_LAT));
         self.target_distance = distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
+        if self.fps {
+            let up = self.target_anchor * DVec3::Z;
+            self.eye = surface_point(up) + up * self.target_distance;
+        }
     }
 
     pub fn jump_view(&mut self, lon: f64, lat: f64, distance: f64) {
@@ -98,10 +110,18 @@ impl Camera {
     pub fn set_orientation(&mut self, heading: f64, tilt: f64) {
         self.target_heading = heading;
         self.target_tilt = tilt.clamp(0.0, MAX_TILT);
+        if self.fps {
+            self.heading = heading;
+            self.tilt = tilt.clamp(FPS_MIN_TILT, FPS_MAX_TILT);
+        }
     }
 
     pub fn update(&mut self, aspect: f32, dt: f64) {
         self.aspect = aspect;
+        if self.fps {
+            self.update_fps(aspect);
+            return;
+        }
         self.target_tilt = self.target_tilt.clamp(0.0, MAX_TILT);
         self.target_distance = self.target_distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
         self.target_anchor = canonical(self.target_anchor);
@@ -119,6 +139,96 @@ impl Camera {
         let ground_dist = self.altitude().max(1.0);
         self.near = (ground_dist * 0.002).clamp(0.5, 20_000.0) as f32;
         self.view_proj = reverse_z_infinite_perspective(self.fov_y, aspect, self.near) * self.view;
+    }
+
+    fn eye_frame(&self) -> DQuat {
+        let (lon, lat) = dir_to_geodetic(self.eye);
+        anchor_at(lon, lat.clamp(-MAX_LAT, MAX_LAT))
+    }
+
+    fn update_fps(&mut self, aspect: f32) {
+        self.tilt = self.tilt.clamp(FPS_MIN_TILT, FPS_MAX_TILT);
+        self.anchor = self.eye_frame();
+        self.target_anchor = self.anchor;
+        self.target_heading = self.heading;
+        self.target_tilt = self.tilt;
+        self.orientation =
+            self.anchor * DQuat::from_rotation_z(self.heading) * DQuat::from_rotation_x(self.tilt);
+
+        let eye_dir = self.eye.normalize();
+        let floor = crate::math::ellipsoid_radius(eye_dir) + self.ground_clearance;
+        if self.eye.length() < floor {
+            self.eye = eye_dir * floor;
+        }
+        self.distance = self.altitude().clamp(MIN_DISTANCE, MAX_DISTANCE);
+        self.target_distance = self.distance;
+
+        self.view = Mat4::from_quat(self.orientation.as_quat()).transpose();
+        let ground_dist = self.altitude().max(1.0);
+        self.near = (ground_dist * 0.002).clamp(0.5, 20_000.0) as f32;
+        self.view_proj = reverse_z_infinite_perspective(self.fov_y, aspect, self.near) * self.view;
+    }
+
+    pub fn set_fps(&mut self, on: bool) {
+        if on == self.fps {
+            return;
+        }
+        self.grab = None;
+        if on {
+            let dir = self.orientation * DVec3::NEG_Z;
+            let local = self.eye_frame().inverse() * dir;
+            self.tilt = (-local.z).clamp(-1.0, 1.0).acos();
+            if local.x.hypot(local.y) > 1e-6 {
+                self.heading = (-local.x).atan2(local.y);
+            }
+            self.fps = true;
+        } else {
+            self.fps = false;
+            match self.pick_dir(0.0, 0.0) {
+                Some(dir) => {
+                    let (lon, lat) = dir_to_geodetic(dir);
+                    self.anchor = anchor_at(lon, lat.clamp(-MAX_LAT, MAX_LAT));
+                    let offset = self.eye - surface_point(self.anchor * DVec3::Z);
+                    self.distance = offset.length().clamp(MIN_DISTANCE, MAX_DISTANCE);
+                    let local = self.anchor.inverse() * offset.normalize();
+                    self.tilt = local.z.clamp(-1.0, 1.0).acos().clamp(0.0, MAX_TILT);
+                    if local.x.hypot(local.y) > 1e-6 {
+                        self.heading = local.x.atan2(-local.y);
+                    }
+                }
+                None => {
+                    self.tilt = self.tilt.clamp(0.0, MAX_TILT);
+                    self.distance = self.altitude().clamp(MIN_DISTANCE, MAX_DISTANCE);
+                    self.anchor = self.eye_frame();
+                }
+            }
+        }
+        self.target_anchor = self.anchor;
+        self.target_distance = self.distance;
+        self.target_heading = self.heading;
+        self.target_tilt = self.tilt;
+    }
+
+    pub fn fly(&mut self, forward: f64, right: f64, up: f64, dt: f64) {
+        let dir = (self.orientation * DVec3::NEG_Z) * forward
+            + (self.orientation * DVec3::X) * right
+            + self.up() * up;
+        if dir.length_squared() < 1e-12 {
+            return;
+        }
+        self.eye += dir.normalize() * self.move_speed * dt;
+    }
+
+    pub fn look(&mut self, dx: f64, dy: f64) {
+        self.heading -= dx * 0.003;
+        self.tilt = (self.tilt - dy * 0.003).clamp(FPS_MIN_TILT, FPS_MAX_TILT);
+        self.target_heading = self.heading;
+        self.target_tilt = self.tilt;
+    }
+
+    pub fn adjust_speed(&mut self, delta: f64) {
+        self.move_speed =
+            (self.move_speed * (-delta * 0.0015).exp()).clamp(MIN_MOVE_SPEED, MAX_MOVE_SPEED);
     }
 
     pub fn view_proj_for_aspect(&self, aspect: f32) -> Mat4 {

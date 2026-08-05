@@ -167,6 +167,8 @@
     font-size: 14px;
   }
 
+  #select-note { color: var(--muted); font-size: 11px; min-height: 13px; }
+
   #debug {
     top: 10px;
     left: 10px;
@@ -250,7 +252,12 @@
     </label>
     <button id="reset">reset view</button>
     <button id="debug-toggle">debug</button>
-    <button id="uncap-toggle">uncap fps</button>  </div>
+    <button id="uncap-toggle">uncap fps</button>
+    <button id="tool-toggle">place balls</button>
+    <button id="select-toggle">select area</button>
+    <button id="fps-toggle">fps mode</button>
+    <div id="select-note"></div>
+  </div>
 </div>
 
 <div id="stress" class="panel">
@@ -291,6 +298,7 @@
       <button id="tile-mode-2">load</button>
       <button id="tile-mode-3">cache</button>
       <button id="tile-mode-4">slot</button>
+      <button id="tile-mode-5">load ms</button>
       <button id="frustum-toggle">frustum</button>
       <button id="bounds-toggle">bounds</button>
     </div>
@@ -323,6 +331,7 @@ if (!navigator.gpu) {
   fail('WebGPU is not available. Use Chrome/Edge 113+, or Firefox with WebGPU enabled.');
 } else {
   await init();
+  window.wr = wr;
   try {
     await wr.start('globe');
   } catch (e) {
@@ -440,8 +449,37 @@ if (!navigator.gpu) {
     uncapToggle.classList.toggle('active', uncapped);
   };
 
+  const toolToggle = document.getElementById('tool-toggle');
+  const selectToggle = document.getElementById('select-toggle');
+  const selectNote = document.getElementById('select-note');
+  let activeTool = 'none';
+  function setTool(name) {
+    activeTool = activeTool === name ? 'none' : name;
+    wr.set_tool(activeTool);
+    toolToggle.classList.toggle('active', activeTool === 'place');
+    selectToggle.classList.toggle('active', activeTool === 'select');
+    selectNote.textContent = activeTool === 'select' ? 'drag on the globe' : '';
+  }
+  toolToggle.onclick = () => setTool('place');
+  selectToggle.onclick = () => setTool('select');
+
+  const fpsToggle = document.getElementById('fps-toggle');
+  let fpsMode = false;
+  const help = document.getElementById('help');
+  const ORBIT_HELP = help.innerHTML;
+  const FPS_HELP = 'mouse: look (click to lock, esc to release) &middot; WASD: move &middot; ' +
+    'space/shift: up/down &middot; wheel: move speed &middot; V: exit fps &middot; ~: debug';
+  function setFpsMode(on) {
+    fpsMode = on;
+    wr.set_fps(on);
+    fpsToggle.classList.toggle('active', on);
+    help.innerHTML = on ? FPS_HELP : ORBIT_HELP;
+  }
+  fpsToggle.onclick = () => setFpsMode(!fpsMode);
+
   addEventListener('keydown', (e) => {
     if (e.key === '~' || e.key === '`') setDebug(!debugPanel.classList.contains('open'));
+    if (e.code === 'KeyV') setFpsMode(!fpsMode);
   });
 
   const TILE_MODES = [
@@ -450,6 +488,10 @@ if (!navigator.gpu) {
     { name: 'load', key: [['imagery resident', '#40ff66'], ['borrowed parent', '#ffd933'], ['in flight', '#4d8cff'], ['failed', '#ff2626']] },
     { name: 'cache', key: [['exact level', '#40ff66'], ['1 level up', '#ffd933'], ['2 levels up', '#ff8026'], ['3+ / none', '#ff3333']] },
     { name: 'slot', key: [['colour = mesh arena slot', '#8a8aa0']] },
+    {
+      name: 'load ms', key: [['0 ms', '#33ff59'], ['300 ms', '#99ff1a'], ['600 ms', '#ffff00'],
+      ['900 ms', '#ff8a13'], ['1200 ms +', '#ff2626'], ['not measured', '#595973']],
+    },
   ];
   const freezeCamToggle = document.getElementById('freeze-cam-toggle');
   const freezeWorkToggle = document.getElementById('freeze-work-toggle');
@@ -523,6 +565,11 @@ if (!navigator.gpu) {
     return '<div class="kv">' + pairs.map(([k, v, cls]) =>
       `<span>${esc(k)}</span><span class="${cls || ''}">${esc(v)}</span>`).join('') + '</div>';
   }
+
+  const ramp = (t) => `color:hsl(${(120 * (1 - Math.max(0, Math.min(1, t)))).toFixed(0)} 80% 58%)`;
+  const msColor = (ms, worst = 1200) => ramp(ms / worst);
+  const pctColor = (pct) => ramp(1 - pct / 100);
+  const cell = (v, style) => `<td style="${style}">${v}</td>`;
 
   function meter(used, cap) {
     const frac = cap > 0 ? used / cap : 0;
@@ -630,6 +677,25 @@ if (!navigator.gpu) {
           `<td>${w.inFlight} / ${d.pool.maxInFlight}</td></tr>`).join('') +
         '</tbody></table>'),
 
+      section('Tile load time',
+        '<table><thead><tr><th>kind</th><th>n</th><th>last</th><th>avg</th><th>max</th>' +
+        '<th>net</th><th>cpu</th><th>wait</th><th>cache</th></tr></thead><tbody>' +
+        (d.loads.length ? d.loads.map((l) =>
+          `<tr><td>${esc(l.kind)}</td><td class="${l.failed ? 'warn' : 'dim'}">${l.n}</td>` +
+          cell(l.lastMs, msColor(l.lastMs)) +
+          cell(l.avgMs, msColor(l.avgMs)) +
+          cell(l.maxMs, msColor(l.maxMs, 4000)) +
+          cell(l.fetchMs, msColor(l.fetchMs)) +
+          cell(l.workMs, msColor(l.workMs, 200)) +
+          cell(l.queueMs, msColor(l.queueMs, 600)) +
+          cell(l.hitPct + '%', pctColor(l.hitPct)) +
+          '</tr>').join('')
+          : '<tr><td colspan="9" class="dim">no tiles loaded yet</td></tr>') +
+        '</tbody></table>' +
+        '<div class="kv"><span>scale</span><span>' +
+        `<b style="${msColor(0)}">0</b> → <b style="${msColor(600)}">600</b> → ` +
+        `<b style="${msColor(1200)}">1200 ms</b></span></div>`),
+
       section('Per level',
         '<table><thead><tr><th>z</th><th>mesh</th><th>img</th><th>drawn</th><th>pend</th></tr></thead><tbody>' +
         d.levels.map((l) =>
@@ -662,7 +728,15 @@ if (!navigator.gpu) {
     const c = wr.camera_state();
     hud.textContent = wr.stats() + '\n' +
       `lon ${c[0].toFixed(3)}  lat ${c[1].toFixed(3)}  alt ${(c[5] / 1000).toFixed(1)} km  ` +
-      `hdg ${c[3].toFixed(0)}  tilt ${c[4].toFixed(0)}`;
+      `hdg ${c[3].toFixed(0)}  tilt ${c[4].toFixed(0)}` +
+      (fpsMode ? `\nfps cam · speed ${(wr.move_speed() * 3.6).toFixed(0)} km/h · wasd + space/shift · wheel = speed` : '');
+    if (activeTool === 'select') {
+      const s = wr.tool_positions();
+      selectNote.textContent = s.length < 10
+        ? 'drag on the globe'
+        : `${s[0].toFixed(3)}, ${s[1].toFixed(3)} · ` +
+          `${(s[8] / 1000).toFixed(2)} × ${(s[9] / 1000).toFixed(2)} km`;
+    }
     if (debugPanel.classList.contains('open')) {
       try { render(JSON.parse(wr.debug_json())); } catch (e) { debugBody.textContent = String(e); }
       const v = JSON.parse(wr.debug_view_json());

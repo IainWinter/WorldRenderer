@@ -3,6 +3,7 @@ use crate::gpu::{Gpu, UploadBudget};
 use crate::math::{horizon_visible, Frustum};
 use crate::stream::{JobKind, WorkerPool};
 use crate::terrain_gpu::{TerrainRenderer, TileInstance, MAX_DRAWN_TILES};
+use crate::terrain_mesh::{HEIGHT_N, HEIGHT_STRIDE};
 use crate::tiling::{
     imagery_max_zoom, imagery_url, max_tile_zoom, terrain_source, tile_at, TileKey, MAX_TILE_HEIGHT,
 };
@@ -43,6 +44,19 @@ const LEVEL_COLORS: [[f32; 3]; 12] = [
     [0.55, 0.55, 0.65],
 ];
 
+const LOAD_MS_WORST: f32 = 1200.0;
+
+fn load_ramp(ms: f32) -> [f32; 3] {
+    let t = (ms / LOAD_MS_WORST).clamp(0.0, 1.0);
+    if t < 0.5 {
+        let k = t * 2.0;
+        [0.2 + 0.8 * k, 1.0, 0.35 * (1.0 - k)]
+    } else {
+        let k = (t - 0.5) * 2.0;
+        [1.0, 1.0 - 0.85 * k, 0.15 * k]
+    }
+}
+
 struct TileShading {
     layer: f32,
     prev_layer: f32,
@@ -68,6 +82,7 @@ struct MeshRes {
     center: DVec3,
     min_height: f32,
     max_height: f32,
+    heights: Vec<f32>,
 }
 
 #[derive(Default)]
@@ -81,11 +96,33 @@ struct Tile {
     imagery_fails: u8,
     mesh_retry_at: u64,
     imagery_retry_at: u64,
+    mesh_ms: f32,
+    imagery_ms: f32,
     last_used: u64,
     last_drawn: u64,
     unfold_at: u64,
     merge_at: u64,
     split: bool,
+}
+
+fn sample_heights(heights: &[f32], key: TileKey, lon: f64, lat: f64) -> f64 {
+    let n = (1u32 << key.z) as f64;
+    let fx =
+        ((lon + std::f64::consts::PI) / std::f64::consts::TAU * n - key.x as f64).clamp(0.0, 1.0);
+    let clamped = lat.clamp(-1.4835, 1.4835);
+    let merc = (clamped.tan() + 1.0 / clamped.cos()).ln() / std::f64::consts::PI;
+    let fy = ((1.0 - merc) * 0.5 * n - key.y as f64).clamp(0.0, 1.0);
+
+    let gx = fx * HEIGHT_N as f64;
+    let gy = fy * HEIGHT_N as f64;
+    let x0 = (gx.floor() as usize).min(HEIGHT_N - 1);
+    let y0 = (gy.floor() as usize).min(HEIGHT_N - 1);
+    let tx = gx - x0 as f64;
+    let ty = gy - y0 as f64;
+    let at = |x: usize, y: usize| heights[y * HEIGHT_STRIDE + x] as f64;
+    let top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
+    let bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
+    top + (bottom - top) * ty
 }
 
 fn ramp(at: u64, frame: u64) -> f32 {
@@ -248,12 +285,29 @@ impl TileTree {
         out
     }
 
-    pub fn ground_height(&self, lon: f64, lat: f64) -> f64 {
+    pub fn ground_ceiling(&self, lon: f64, lat: f64) -> f64 {
         let mut z = max_tile_zoom();
         loop {
             let key = tile_at(lon, lat, z);
             if let Some(h) = self.tiles.get(&key).and_then(|t| t.mesh.as_ref()) {
                 return h.max_height as f64;
+            }
+            if z == 0 {
+                return 0.0;
+            }
+            z -= 1;
+        }
+    }
+
+    pub fn ground_height(&self, lon: f64, lat: f64) -> f64 {
+        let mut z = max_tile_zoom();
+        loop {
+            let key = tile_at(lon, lat, z);
+            if let Some(mesh) = self.tiles.get(&key).and_then(|t| t.mesh.as_ref()) {
+                if mesh.heights.len() == HEIGHT_STRIDE * HEIGHT_STRIDE {
+                    return sample_heights(&mesh.heights, key, lon, lat);
+                }
+                return mesh.max_height as f64;
             }
             if z == 0 {
                 return 0.0;
@@ -656,6 +710,16 @@ impl TileTree {
                     (0.25 + (h & 0xff) as f32 / 340.0).min(1.0),
                 ]
             }
+            5 => {
+                let tile = self.tiles.get(&key);
+                let ms = tile
+                    .map(|t| t.mesh_ms.max(t.imagery_ms))
+                    .filter(|ms| *ms > 0.0);
+                match ms {
+                    Some(ms) => load_ramp(ms),
+                    None => [0.35, 0.35, 0.45],
+                }
+            }
             _ => return [0.0, 0.0, 0.0, 0.0],
         };
         [rgb[0], rgb[1], rgb[2], a]
@@ -818,7 +882,7 @@ impl TileTree {
         self.uploaded_bytes = 0;
         let frame = self.frame;
         let mut leftover = Vec::new();
-        for msg in deferred.drain(..) {
+        for mut msg in deferred.drain(..) {
             let bytes = msg
                 .payload
                 .as_ref()
@@ -850,11 +914,13 @@ impl TileTree {
                     let tile = self.tiles.entry(msg.key).or_default();
                     tile.mesh_fails = 0;
                     tile.mesh_inbound = false;
+                    tile.mesh_ms = msg.load_ms;
                     let replaced = tile.mesh.replace(MeshRes {
                         slot,
                         center: msg.center,
                         min_height: msg.min_height,
                         max_height: msg.max_height,
+                        heights: std::mem::take(&mut msg.heights),
                     });
                     if let Some(old) = replaced {
                         renderer.slots.free(old.slot);
@@ -884,6 +950,7 @@ impl TileTree {
                     let tile = self.tiles.entry(msg.key).or_default();
                     tile.imagery_fails = 0;
                     tile.imagery_inbound = false;
+                    tile.imagery_ms = msg.load_ms;
                     tile.imagery_at = frame;
                     if let Some(old) = tile.imagery.replace(layer) {
                         renderer.layers.free(old);

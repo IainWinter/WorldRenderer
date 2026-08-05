@@ -3,6 +3,8 @@ use crate::tiling::{merc_y_to_lat, TileKey};
 use glam::{DVec3, Vec3};
 
 pub const GRID_N: u32 = 32;
+pub const HEIGHT_N: usize = 16;
+pub const HEIGHT_STRIDE: usize = HEIGHT_N + 1;
 pub const CORE_VERTS: u32 = (GRID_N + 1) * (GRID_N + 1);
 pub const SKIRT_VERTS: u32 = 4 * GRID_N;
 pub const TOTAL_VERTS: u32 = CORE_VERTS + SKIRT_VERTS;
@@ -109,6 +111,7 @@ pub struct BuiltMesh {
     pub vertices: Vec<TerrainVertex>,
     pub min_height: f32,
     pub max_height: f32,
+    pub heights: Vec<f32>,
 }
 
 pub fn build_mesh(key: TileKey, hm: &Heightmap, uv: [f64; 3]) -> BuiltMesh {
@@ -135,6 +138,8 @@ pub fn build_mesh(key: TileKey, hm: &Heightmap, uv: [f64; 3]) -> BuiltMesh {
     let mut ups = vec![DVec3::ZERO; stride * stride];
     let mut min_h = f32::MAX;
     let mut max_h = f32::MIN;
+    let sample_step = stride / HEIGHT_N;
+    let mut heights = Vec::with_capacity(HEIGHT_STRIDE * HEIGHT_STRIDE);
     for y in 0..stride {
         for x in 0..stride {
             let u = x as f64 / n as f64;
@@ -142,6 +147,9 @@ pub fn build_mesh(key: TileKey, hm: &Heightmap, uv: [f64; 3]) -> BuiltMesh {
             let hgt = hm.sample(uv[1] + u * uv[0], uv[2] + v * uv[0]);
             min_h = min_h.min(hgt as f32);
             max_h = max_h.max(hgt as f32);
+            if x % sample_step == 0 && y % sample_step == 0 {
+                heights.push(hgt as f32);
+            }
             world[y * stride + x] = geodetic_to_ecef(lons[x], lats[y], hgt);
             ups[y * stride + x] = geodetic_surface_normal(lons[x], lats[y]);
         }
@@ -225,6 +233,7 @@ pub fn build_mesh(key: TileKey, hm: &Heightmap, uv: [f64; 3]) -> BuiltMesh {
         vertices,
         min_height: min_h,
         max_height: max_h,
+        heights,
     }
 }
 

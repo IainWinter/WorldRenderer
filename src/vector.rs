@@ -1,10 +1,18 @@
 use crate::gpu::{Gpu, DEPTH_FORMAT};
-use crate::math::{geodetic_surface_normal, geodetic_to_ecef};
+use crate::math::{dir_to_geodetic, geodetic_surface_normal, geodetic_to_ecef};
 use glam::{DVec3, Vec3};
 
 pub const BATCH_STRIDE: u64 = 256;
 pub const MAX_BATCHES: u64 = 4096;
 pub const DEBUG_SLOT: u32 = MAX_BATCHES as u32 - 1;
+pub const SELECT_FILL_SLOT: u32 = MAX_BATCHES as u32 - 2;
+pub const SELECT_EDGE_SLOT: u32 = MAX_BATCHES as u32 - 3;
+
+const SELECT_GRID: usize = 16;
+const SELECT_EDGE_STEPS: usize = 12;
+const SELECT_FILL_COLOR: u32 = 0xb9bcc82e;
+const SELECT_EDGE_COLOR: u32 = 0xe4e7f0ff;
+const SELECT_EDGE_WIDTH: f32 = 2.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -32,11 +40,23 @@ pub struct IconInstance {
     pub color: [u8; 4],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DashInstance {
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+    pub na: [f32; 3],
+    pub nb: [f32; 3],
+    pub color: [u8; 4],
+    pub width: f32,
+}
+
 pub enum BatchKind {
     Polygon { indices: wgpu::Buffer, count: u32 },
     Tube { indices: wgpu::Buffer, count: u32 },
     Line { count: u32 },
     Icon { count: u32 },
+    Dash { count: u32 },
 }
 
 pub struct Batch {
@@ -52,6 +72,8 @@ pub struct VectorRenderer {
     pub poly_pipeline: wgpu::RenderPipeline,
     pub line_pipeline: wgpu::RenderPipeline,
     pub icon_pipeline: wgpu::RenderPipeline,
+    pub overlay_fill_pipeline: wgpu::RenderPipeline,
+    pub overlay_dash_pipeline: wgpu::RenderPipeline,
     pub globals_bg: wgpu::BindGroup,
     pub batch_bg: wgpu::BindGroup,
     pub icon_bg: wgpu::BindGroup,
@@ -64,6 +86,8 @@ pub struct VectorRenderer {
     pub batch_uniform: wgpu::Buffer,
     pub batches: Vec<Batch>,
     pub debug: Option<Batch>,
+    pub markers: Vec<Batch>,
+    pub selection: Option<(Batch, Batch)>,
     next_slot: u32,
 }
 
@@ -388,10 +412,144 @@ impl VectorRenderer {
             cache: None,
         });
 
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("overlay shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/overlay.wgsl").into()),
+        });
+
+        let overlay_depth = || {
+            Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            })
+        };
+
+        let overlay_fill_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("overlay fill pipeline"),
+                layout: Some(&pl2),
+                vertex: wgpu::VertexState {
+                    module: &overlay_shader,
+                    entry_point: Some("vs_fill"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: 28,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Unorm8x4,
+                                offset: 24,
+                                shader_location: 2,
+                            },
+                        ],
+                    })],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: overlay_depth(),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &overlay_shader,
+                    entry_point: Some("fs_fill"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: gpu.config.format,
+                        blend: alpha_blend(),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let overlay_dash_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("overlay dash pipeline"),
+                layout: Some(&pl2),
+                vertex: wgpu::VertexState {
+                    module: &overlay_shader,
+                    entry_point: Some("vs_dash"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: 56,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 24,
+                                shader_location: 2,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 36,
+                                shader_location: 3,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Unorm8x4,
+                                offset: 48,
+                                shader_location: 4,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32,
+                                offset: 52,
+                                shader_location: 5,
+                            },
+                        ],
+                    })],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: overlay_depth(),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &overlay_shader,
+                    entry_point: Some("fs_dash"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: gpu.config.format,
+                        blend: alpha_blend(),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
         Self {
             poly_pipeline,
             line_pipeline,
             icon_pipeline,
+            overlay_fill_pipeline,
+            overlay_dash_pipeline,
             globals_bg,
             batch_bg,
             icon_bg,
@@ -404,6 +562,8 @@ impl VectorRenderer {
             batch_uniform,
             batches: Vec::new(),
             debug: None,
+            markers: Vec::new(),
+            selection: None,
             next_slot: 0,
         }
     }
@@ -492,6 +652,7 @@ impl VectorRenderer {
                 BatchKind::Tube { .. } => out.1 += 1,
                 BatchKind::Line { .. } => out.2 += 1,
                 BatchKind::Icon { .. } => out.3 += 1,
+                BatchKind::Dash { .. } => {}
             }
             out.4 += b.vertices;
             out.5 += b.triangles;
@@ -501,8 +662,52 @@ impl VectorRenderer {
 
     fn take_slot(&mut self) -> u32 {
         let slot = self.next_slot;
-        self.next_slot = (self.next_slot + 1) % DEBUG_SLOT;
+        self.next_slot = (self.next_slot + 1) % SELECT_EDGE_SLOT;
         slot
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_selection(
+        &mut self,
+        gpu: &Gpu,
+        anchor: DVec3,
+        right: DVec3,
+        forward: DVec3,
+        u: f64,
+        v: f64,
+        height: f64,
+    ) {
+        self.selection = Some(build_selection(gpu, anchor, right, forward, u, v, height));
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn add_marker(&mut self, gpu: &Gpu, position: DVec3, radius: f64, color: u32) -> usize {
+        let slot = self.take_slot();
+        let batch = build_marker(gpu, position, radius, color, slot);
+        self.markers.push(batch);
+        self.markers.len() - 1
+    }
+
+    pub fn set_marker(
+        &mut self,
+        gpu: &Gpu,
+        index: usize,
+        position: DVec3,
+        radius: f64,
+        color: u32,
+    ) {
+        let Some(existing) = self.markers.get(index) else {
+            return;
+        };
+        let slot = existing.slot;
+        self.markers[index] = build_marker(gpu, position, radius, color, slot);
+    }
+
+    pub fn clear_markers(&mut self) {
+        self.markers.clear();
     }
 
     pub fn set_debug_lines(
@@ -880,7 +1085,14 @@ impl VectorRenderer {
     }
 
     pub fn update_origins(&self, gpu: &Gpu, eye: DVec3) {
-        for batch in self.batches.iter().chain(self.debug.iter()) {
+        let selection = self.selection.iter().flat_map(|(a, b)| [a, b]);
+        for batch in self
+            .batches
+            .iter()
+            .chain(self.debug.iter())
+            .chain(self.markers.iter())
+            .chain(selection)
+        {
             let rel = (batch.origin - eye).as_vec3();
             let data = [rel.x, rel.y, rel.z, 0.0f32];
             gpu.queue.write_buffer(
@@ -892,13 +1104,17 @@ impl VectorRenderer {
     }
 
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        if self.batches.is_empty() && self.debug.is_none() {
+        if self.batches.is_empty()
+            && self.debug.is_none()
+            && self.markers.is_empty()
+            && self.selection.is_none()
+        {
             return;
         }
         pass.set_bind_group(0, &self.globals_bg, &[]);
 
         pass.set_pipeline(&self.poly_pipeline);
-        for batch in self.batches.iter() {
+        for batch in self.batches.iter().chain(self.markers.iter()) {
             let (BatchKind::Polygon { indices, count } | BatchKind::Tube { indices, count }) =
                 &batch.kind
             else {
@@ -928,6 +1144,197 @@ impl VectorRenderer {
                 pass.draw(0..6, 0..*count);
             }
         }
+
+        if let Some((fill, edge)) = &self.selection {
+            if let BatchKind::Polygon { indices, count } = &fill.kind {
+                pass.set_pipeline(&self.overlay_fill_pipeline);
+                pass.set_bind_group(1, &self.batch_bg, &[fill.slot * BATCH_STRIDE as u32]);
+                pass.set_vertex_buffer(0, fill.buffer.slice(..));
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..*count, 0, 0..1);
+            }
+            if let BatchKind::Dash { count } = &edge.kind {
+                pass.set_pipeline(&self.overlay_dash_pipeline);
+                pass.set_bind_group(1, &self.batch_bg, &[edge.slot * BATCH_STRIDE as u32]);
+                pass.set_vertex_buffer(0, edge.buffer.slice(..));
+                pass.draw(0..6, 0..*count);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_selection(
+    gpu: &Gpu,
+    anchor: DVec3,
+    right: DVec3,
+    forward: DVec3,
+    u: f64,
+    v: f64,
+    height: f64,
+) -> (Batch, Batch) {
+    let on_surface = |s: f64, t: f64| {
+        let flat = anchor + right * (u * s) + forward * (v * t);
+        let (lon, lat) = dir_to_geodetic(flat);
+        (geodetic_to_ecef(lon, lat, height), lon, lat)
+    };
+    let (origin, ..) = on_surface(0.5, 0.5);
+    let fill_rgba = unpack_color(SELECT_FILL_COLOR);
+    let edge_rgba = unpack_color(SELECT_EDGE_COLOR);
+    let at = |s: f64, t: f64| {
+        let (point, lon, lat) = on_surface(s, t);
+        (
+            (point - origin).as_vec3(),
+            geodetic_surface_normal(lon, lat).as_vec3(),
+        )
+    };
+
+    let mut verts: Vec<PolyVertex> = Vec::with_capacity((SELECT_GRID + 1) * (SELECT_GRID + 1));
+    for row in 0..=SELECT_GRID {
+        let t = row as f64 / SELECT_GRID as f64;
+        for col in 0..=SELECT_GRID {
+            let s = col as f64 / SELECT_GRID as f64;
+            let (pos, nrm) = at(s, t);
+            verts.push(PolyVertex {
+                pos: pos.to_array(),
+                nrm: nrm.to_array(),
+                color: fill_rgba,
+            });
+        }
+    }
+    let stride = SELECT_GRID + 1;
+    let mut indices: Vec<u32> = Vec::with_capacity(SELECT_GRID * SELECT_GRID * 6);
+    for row in 0..SELECT_GRID {
+        for col in 0..SELECT_GRID {
+            let a = (row * stride + col) as u32;
+            let b = a + 1;
+            let c = ((row + 1) * stride + col) as u32 + 1;
+            let d = ((row + 1) * stride + col) as u32;
+            indices.extend_from_slice(&[a, b, c, a, c, d]);
+        }
+    }
+
+    let mut loop_points: Vec<(f64, f64)> = Vec::with_capacity(SELECT_EDGE_STEPS * 4 + 1);
+    let edges = [
+        (0.0, 0.0, 1.0, 0.0),
+        (1.0, 0.0, 1.0, 1.0),
+        (1.0, 1.0, 0.0, 1.0),
+        (0.0, 1.0, 0.0, 0.0),
+    ];
+    for (s0, t0, s1, t1) in edges {
+        for step in 0..SELECT_EDGE_STEPS {
+            let k = step as f64 / SELECT_EDGE_STEPS as f64;
+            loop_points.push((s0 + (s1 - s0) * k, t0 + (t1 - t0) * k));
+        }
+    }
+    loop_points.push((0.0, 0.0));
+
+    let dashes: Vec<DashInstance> = loop_points
+        .windows(2)
+        .map(|pair| {
+            let (pa, na) = at(pair[0].0, pair[0].1);
+            let (pb, nb) = at(pair[1].0, pair[1].1);
+            DashInstance {
+                a: pa.to_array(),
+                b: pb.to_array(),
+                na: na.to_array(),
+                nb: nb.to_array(),
+                color: edge_rgba,
+                width: SELECT_EDGE_WIDTH,
+            }
+        })
+        .collect();
+
+    let fill = Batch {
+        origin,
+        buffer: upload_buffer(
+            gpu,
+            "selection fill",
+            bytemuck::cast_slice(&verts),
+            wgpu::BufferUsages::VERTEX,
+        ),
+        kind: BatchKind::Polygon {
+            indices: upload_buffer(
+                gpu,
+                "selection fill indices",
+                bytemuck::cast_slice(&indices),
+                wgpu::BufferUsages::INDEX,
+            ),
+            count: indices.len() as u32,
+        },
+        slot: SELECT_FILL_SLOT,
+        vertices: verts.len() as u32,
+        triangles: (indices.len() / 3) as u32,
+    };
+    let count = dashes.len() as u32;
+    let edge = Batch {
+        origin,
+        buffer: upload_buffer(
+            gpu,
+            "selection edge",
+            bytemuck::cast_slice(&dashes),
+            wgpu::BufferUsages::VERTEX,
+        ),
+        kind: BatchKind::Dash { count },
+        slot: SELECT_EDGE_SLOT,
+        vertices: count * 6,
+        triangles: count * 2,
+    };
+    (fill, edge)
+}
+
+fn build_marker(gpu: &Gpu, position: DVec3, radius: f64, color: u32, slot: u32) -> Batch {
+    const RINGS: usize = 12;
+    const SEGMENTS: usize = 20;
+    let rgba = unpack_color(color);
+    let mut verts: Vec<PolyVertex> = Vec::with_capacity((RINGS + 1) * (SEGMENTS + 1));
+    let mut indices: Vec<u32> = Vec::with_capacity(RINGS * SEGMENTS * 6);
+    for r in 0..=RINGS {
+        let phi = std::f64::consts::PI * r as f64 / RINGS as f64;
+        let (sin_phi, cos_phi) = phi.sin_cos();
+        for s in 0..=SEGMENTS {
+            let theta = std::f64::consts::TAU * s as f64 / SEGMENTS as f64;
+            let (sin_theta, cos_theta) = theta.sin_cos();
+            let dir = DVec3::new(sin_phi * cos_theta, sin_phi * sin_theta, cos_phi);
+            verts.push(PolyVertex {
+                pos: (dir * radius).as_vec3().to_array(),
+                nrm: dir.as_vec3().to_array(),
+                color: rgba,
+            });
+        }
+    }
+    let stride = SEGMENTS + 1;
+    for r in 0..RINGS {
+        for s in 0..SEGMENTS {
+            let a = (r * stride + s) as u32;
+            let b = (r * stride + s + 1) as u32;
+            let c = ((r + 1) * stride + s + 1) as u32;
+            let d = ((r + 1) * stride + s) as u32;
+            indices.extend_from_slice(&[a, b, c, a, c, d]);
+        }
+    }
+    let vbuf = upload_buffer(
+        gpu,
+        "marker verts",
+        bytemuck::cast_slice(&verts),
+        wgpu::BufferUsages::VERTEX,
+    );
+    let ibuf = upload_buffer(
+        gpu,
+        "marker indices",
+        bytemuck::cast_slice(&indices),
+        wgpu::BufferUsages::INDEX,
+    );
+    Batch {
+        origin: position,
+        buffer: vbuf,
+        kind: BatchKind::Polygon {
+            indices: ibuf,
+            count: indices.len() as u32,
+        },
+        slot,
+        vertices: verts.len() as u32,
+        triangles: indices.len() as u32 / 3,
     }
 }
 

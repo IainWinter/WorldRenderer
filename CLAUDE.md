@@ -41,6 +41,14 @@ Left drag pans (the grabbed point stays under the cursor at any heading or tilt)
 Wheel zooms toward the cursor. Right or shift drag tilts and rotates. WASD flies,
 QE rotates, RF tilts. North is up at tilt 0.
 
+Tools take over the pointer when active (`set_tool`): `place` drops balls, `select` drags a
+rectangle. The selection is an overlay — one constant height taken from the anchor's terrain
+hit, depth compare `Always`, so it draws over relief instead of draping on it, and the shader
+drops vertices past the horizon so it never shows through the far side of the globe. Its axes
+come from the camera's screen axes flattened onto the tangent plane, so it is camera-oriented,
+not north-aligned; the dragged corner is the ray hit on the overlay's own height surface
+(`ellipsoid_entry_at`), which is what keeps the corner under the cursor at any tilt.
+
 ## Invariants
 
 - Nothing that touches the network or decodes an image runs on the main thread. Workers only.
@@ -61,3 +69,7 @@ QE rotates, RF tilts. North is up at tilt 0.
 
 - Terrain: AWS Terrain Tiles, terrarium PNG, max z15.
 - Imagery: EOX Sentinel-2 cloudless WMTS, max z14. CC BY 4.0 — keep the attribution in `index.html`.
+- Every worker fetch goes through the Cache Storage bucket `worldrenderer-tiles-v1` (persists across
+  reloads, secure context only - `http://localhost` or https). Budget defaults to 16384 MB, set with
+  `set_cache_limit_mb` (0 disables); over budget it evicts oldest-first down to 90%. `clear_cache`,
+  `cache_usage_mb`.

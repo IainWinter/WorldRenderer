@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WorldRenderer</title>
+<link rel="icon" href="data:,">
 <style>
   :root {
     color-scheme: dark;
@@ -606,6 +607,8 @@ if (!navigator.gpu) {
 
     const html = [
       section('Frame', rows([
+        ['backend', d.frame.backend, d.frame.backend === 'WebGPU' ? 'ok' : 'warn'],
+        ['adapter', d.frame.adapter],
         ['fps (presented)', d.frame.fps.toFixed(1), d.frame.fps < 30 ? 'warn' : ''],
         ['fps (cpu ceiling)', d.frame.uncappedFps, d.frame.uncappedFps < 60 ? 'warn' : 'ok'],
         ['cpu ms', d.frame.ms.toFixed(2), d.frame.ms > 16 ? 'warn' : ''],

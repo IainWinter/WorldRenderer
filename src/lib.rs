@@ -862,7 +862,7 @@ pub fn debug_json() -> String {
                     "{{",
                     "\"frame\":{{\"fps\":{:.1},\"ms\":{:.2},\"msAvg\":{:.2},\"uncappedFps\":{:.0},",
                     "\"uncapped\":{},\"width\":{},\"height\":{},\"scale\":{:.2},",
-                    "\"dpr\":{:.2}}},",
+                    "\"dpr\":{:.2},\"backend\":\"{}\",\"adapter\":\"{}\"}},",
                     "\"camera\":{{\"lon\":{:.5},\"lat\":{:.5},\"alt\":{:.1},\"distance\":{:.1},",
                     "\"heading\":{:.1},\"tilt\":{:.1},\"clearance\":{:.1}}},",
                     "\"draw\":{{\"drawn\":{},\"instances\":{},\"minLevel\":{},\"maxLevel\":{},",
@@ -896,6 +896,8 @@ pub fn debug_json() -> String {
                 app.gpu.config.height,
                 app.resolution_scale,
                 device_pixel_ratio(),
+                app.gpu.backend,
+                app.gpu.adapter,
                 lon.to_degrees(),
                 lat.to_degrees(),
                 app.camera.altitude(),
@@ -1733,11 +1735,11 @@ pub async fn read_pixels(size: u32) -> Vec<u8> {
                 app.gpu.config.width as f32,
                 app.gpu.config.height as f32,
             );
-            Some((buffer, color, depth))
+            Some((buffer, color, depth, app.gpu.config.format))
         },
         None,
     );
-    let Some((buffer, _color, _depth)) = buffer else {
+    let Some((buffer, _color, _depth, format)) = buffer else {
         return Vec::new();
     };
 
@@ -1750,20 +1752,30 @@ pub async fn read_pixels(size: u32) -> Vec<u8> {
         if *done.borrow() {
             break;
         }
+        with_app(
+            |app| {
+                let _ = app.gpu.device.poll(wgpu::PollType::Poll);
+            },
+            (),
+        );
         yield_task().await;
     }
     if !*done.borrow() {
         return Vec::new();
     }
-    let bgra = buffer.slice(..).get_mapped_range().unwrap().to_vec();
+    let raw = buffer.slice(..).get_mapped_range().unwrap().to_vec();
+    let (r, b) = match format {
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => (2, 0),
+        _ => (0, 2),
+    };
     let mut rgba = vec![255u8; (row_bytes * size) as usize];
     for row in 0..size as usize {
-        let src = &bgra[row * padded_row as usize..][..row_bytes as usize];
+        let src = &raw[row * padded_row as usize..][..row_bytes as usize];
         let dst = &mut rgba[row * row_bytes as usize..][..row_bytes as usize];
         for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-            d[0] = s[2];
+            d[0] = s[r];
             d[1] = s[1];
-            d[2] = s[0];
+            d[2] = s[b];
             d[3] = 255;
         }
     }

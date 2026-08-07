@@ -44,7 +44,10 @@ pub struct TerrainRenderer {
 impl TerrainRenderer {
     pub fn new(gpu: &Gpu) -> Self {
         let device = &gpu.device;
-        let layer_cap = IMAGERY_LAYERS.min(device.limits().max_texture_array_layers);
+        let mut layer_cap = IMAGERY_LAYERS.min(device.limits().max_texture_array_layers);
+        if layer_cap % 6 == 0 {
+            layer_cap -= 1;
+        }
 
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain globals"),

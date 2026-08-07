@@ -1,4 +1,4 @@
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{JsCast, JsValue};
 use web_sys::HtmlCanvasElement;
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -9,6 +9,8 @@ pub struct Gpu {
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
     pub depth: wgpu::TextureView,
+    pub backend: &'static str,
+    pub adapter: String,
 }
 
 impl Gpu {
@@ -16,8 +18,15 @@ impl Gpu {
         let width = canvas.width().max(1);
         let height = canvas.height().max(1);
 
+        let webgpu_name = webgpu_adapter_name().await;
+        let (backends, backend) = if webgpu_name.is_some() {
+            (wgpu::Backends::BROWSER_WEBGPU, "WebGPU")
+        } else {
+            (wgpu::Backends::GL, "WebGL2")
+        };
+
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU,
+            backends,
             flags: wgpu::InstanceFlags::default(),
             memory_budget_thresholds: Default::default(),
             backend_options: Default::default(),
@@ -38,7 +47,16 @@ impl Gpu {
                 apply_limit_buckets: false,
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("no {backend} adapter: {e}"))?;
+
+        let webgpu_name = webgpu_name.unwrap_or_default();
+        let info_name = adapter.get_info().name;
+        let adapter_name = [info_name.trim(), webgpu_name.trim()]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .unwrap_or("unnamed")
+            .replace('\\', " ")
+            .replace('"', "'");
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -74,6 +92,8 @@ impl Gpu {
             surface,
             config,
             depth,
+            backend,
+            adapter: adapter_name,
         })
     }
 
@@ -93,6 +113,36 @@ impl Gpu {
     pub fn aspect(&self) -> f32 {
         self.config.width as f32 / self.config.height.max(1) as f32
     }
+}
+
+async fn webgpu_adapter_name() -> Option<String> {
+    let navigator = web_sys::window().map(|w| w.navigator())?;
+    let gpu = js_sys::Reflect::get(&navigator, &JsValue::from_str("gpu")).ok()?;
+    let request = js_sys::Reflect::get(&gpu, &JsValue::from_str("requestAdapter"))
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())?;
+    let promise = request
+        .call0(&gpu)
+        .and_then(|p| p.dyn_into::<js_sys::Promise>())
+        .ok()?;
+    let adapter = wasm_bindgen_futures::JsFuture::from(promise).await.ok()?;
+    if adapter.is_null() || adapter.is_undefined() {
+        return None;
+    }
+
+    let info = js_sys::Reflect::get(&adapter, &JsValue::from_str("info")).unwrap_or(JsValue::NULL);
+    let field = |key: &str| {
+        js_sys::Reflect::get(&info, &JsValue::from_str(key))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default()
+    };
+    let name = [field("vendor"), field("architecture"), field("device")]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(name)
 }
 
 fn make_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

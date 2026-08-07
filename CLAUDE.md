@@ -13,7 +13,8 @@ High-performance 3D globe renderer. Rust → wasm → WebGPU.
 
 ## Language
 
-Rust, `wasm32-unknown-unknown`, wgpu on the WebGPU backend. Shaders are WGSL in `src/shaders/`.
+Rust, `wasm32-unknown-unknown`, wgpu on the WebGPU backend, falling back to WebGL2 when
+`navigator.gpu.requestAdapter()` returns null. Shaders are WGSL in `src/shaders/`.
 
 ## Layout
 
@@ -62,6 +63,12 @@ not north-aligned; the dragged corner is the ray hit on the overlay's own height
 - LOD never pops: each vertex carries a morph target toward the parent grid and tiles blend
   into their parent as they shrink. Imagery cross-fades over `IMAGERY_FADE_FRAMES`.
 - The camera eye is clamped above the terrain under it every frame.
+- `map_async` never completes on the WebGL2 backend unless the device is polled. Any readback
+  loop must call `device.poll(PollType::Poll)` while it waits; it is a no-op under WebGPU.
+- The imagery atlas layer count must never be a multiple of 6. It is square, so wgpu-hal's
+  GL backend calls that "cube compatible" and binds `GL_TEXTURE_CUBE_MAP_ARRAY`, which does
+  not exist in WebGL2 - every upload fails with `INVALID_ENUM` and the globe goes black with
+  no other symptom. `TerrainRenderer::new` drops the cap by one when it lands on a multiple.
 - Anything that allocates a mesh slot or imagery layer must free the old one on replace,
   or the arena leaks and the globe silently stops loading.
 

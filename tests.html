@@ -47,13 +47,16 @@ window.addEventListener('error', e => consoleErrors.push('uncaught: ' + e.messag
 window.addEventListener('unhandledrejection', e => consoleErrors.push('rejection: ' + e.reason));
 
 const canvas = document.getElementById('globe');
-const state = { pass: 0, fail: 0, tests: [] };
+const state = { pass: 0, fail: 0, skip: 0, tests: [] };
 window.__results = state;
+const SKIP = Symbol('skip');
 
 function row(name, ok, detail) {
   const div = document.createElement('div');
+  const label = ok === SKIP ? 'SKIP' : ok ? 'PASS' : 'FAIL';
+  const cls = ok === SKIP ? 'skip' : ok ? 'pass' : 'fail';
   div.className = 'row';
-  div.innerHTML = `<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>` +
+  div.innerHTML = `<span class="${cls}">${label}</span>` +
     `<span>${name}<span class="detail"> ${detail ?? ''}</span></span>`;
   results.appendChild(div);
 }
@@ -61,9 +64,16 @@ function row(name, ok, detail) {
 async function test(name, fn) {
   let ok = false, detail = '';
   try {
-    detail = (await fn()) ?? '';
-    ok = true;
-    state.pass++;
+    const r = await fn();
+    if (r && r.skip === SKIP) {
+      ok = SKIP;
+      detail = r.why ?? '';
+      state.skip++;
+    } else {
+      detail = r ?? '';
+      ok = true;
+      state.pass++;
+    }
   } catch (e) {
     detail = String(e && e.message ? e.message : e);
     state.fail++;
@@ -72,7 +82,7 @@ async function test(name, fn) {
   try { after = JSON.parse(wr.stats_json()); } catch (e) {}
   state.tests.push({ name, ok, detail, after });
   row(name, ok, detail);
-  summary.textContent = `${state.pass} passed, ${state.fail} failed`;
+  summary.textContent = `${state.pass} passed, ${state.fail} failed` + (state.skip ? `, ${state.skip} skipped` : '');
 }
 
 function assert(cond, msg) {
@@ -180,8 +190,8 @@ async function drag(x0, y0, x1, y1, opts = {}) {
 
 // ---------------------------------------------------------------- run
 
-if (!navigator.gpu) {
-  summary.textContent = 'WebGPU unavailable — cannot run tests.';
+if (!navigator.gpu && !document.createElement('canvas').getContext('webgl2')) {
+  summary.textContent = 'Neither WebGPU nor WebGL2 is available — cannot run tests.';
 } else {
   await init();
   await wr.start('globe');
@@ -191,7 +201,8 @@ if (!navigator.gpu) {
   const CX = W / 2, CY = H / 2;
 
   await test('every shader compiles without errors', async () => {
-    const adapter = await navigator.gpu.requestAdapter();
+    const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+    if (!adapter) return { skip: SKIP, why: 'no WebGPU adapter (WebGL2 path)' };
     const device = await adapter.requestDevice();
     const names = ['terrain', 'polygon', 'line', 'icon', 'model'];
     const problems = [];
@@ -762,7 +773,8 @@ if (!navigator.gpu) {
 
   wr.set_running(true);
   summary.innerHTML = `<b class="${state.fail ? 'fail' : 'pass'}">` +
-    `${state.pass} passed, ${state.fail} failed</b>`;
+    `${state.pass} passed, ${state.fail} failed</b>` +
+    (state.skip ? `<span class="skip"> ${state.skip} skipped</span>` : '');
   window.__results = state;
   window.__done = true;
 }
